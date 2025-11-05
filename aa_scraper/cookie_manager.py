@@ -1,4 +1,4 @@
-"""Cookie management with automatic refresh"""
+"""Cookie management with automatic refresh and retry logic"""
 
 import asyncio
 import json
@@ -18,8 +18,9 @@ from .exceptions import CookieExpiredError
 
 class CookieManager:
     """
-    Manages cookies with automatic refresh and validation.
+    Manages cookies with automatic refresh, validation, and retry logic.
     Tracks cookie age and automatically extracts when needed.
+    Handles rate limiting by clearing old cookies and backing off.
     """
 
     def __init__(
@@ -48,6 +49,10 @@ class CookieManager:
         self.referer: str = ""
         self.extract_time: Optional[datetime] = None
         self.lock = asyncio.Lock()
+        
+        # Retry tracking
+        self.consecutive_failures = 0
+        self.last_failure_time: Optional[datetime] = None
 
         logger.info(f"Cookie manager initialized: {cookie_file}")
 
@@ -84,20 +89,79 @@ class CookieManager:
 
         return True
 
+    def _clear_cookies(self) -> None:
+        """Clear all stored cookies and related data"""
+        logger.warning("🗑️ Clearing old cookies...")
+        self.cookies = {}
+        self.headers = {}
+        self.referer = ""
+        self.extract_time = None
+        
+        # Remove cookie files
+        try:
+            if self.cookie_file.exists():
+                self.cookie_file.unlink()
+            
+            headers_file = self.cookie_file.parent / f"{self.cookie_file.stem}_headers.json"
+            if headers_file.exists():
+                headers_file.unlink()
+            
+            referer_file = self.cookie_file.parent / f"{self.cookie_file.stem}_referer.txt"
+            if referer_file.exists():
+                referer_file.unlink()
+                
+            logger.success("✓ Old cookies cleared")
+        except Exception as e:
+            logger.warning(f"Error clearing cookie files: {e}")
+
+    def _is_rate_limited(self, error_msg: str) -> bool:
+        """Detect if error is due to rate limiting"""
+        rate_limit_indicators = [
+            "valid api response not received",
+            "timeout",
+            "no valid pricing",
+            "empty slices",
+            "api request did not complete",
+        ]
+        error_lower = error_msg.lower()
+        return any(indicator in error_lower for indicator in rate_limit_indicators)
+
+    def _calculate_backoff(self, attempt: int, base_delay: float = 30.0) -> float:
+        """Calculate exponential backoff delay"""
+        import random
+        
+        # Exponential backoff: base * 2^attempt with jitter
+        delay = base_delay * (2 ** attempt)
+        # Add jitter (±25%)
+        jitter = random.uniform(0.75, 1.25)
+        final_delay = min(delay * jitter, 300.0)  # Cap at 5 minutes
+        
+        return final_delay
+
     async def get_cookies(
-        self, force_refresh: bool = False, headless: bool = True, wait_time: int = 15
+        self, 
+        force_refresh: bool = False, 
+        headless: bool = True, 
+        wait_time: int = 15,
+        max_retries: int = 3,
+        base_retry_delay: float = 30.0,
     ) -> Tuple[Dict[str, str], Dict[str, str], str]:
         """
-        Get cookies with automatic refresh if needed.
-        Thread-safe with lock.
+        Get cookies with automatic refresh and retry logic.
+        Thread-safe with lock. Handles rate limiting intelligently.
 
         Args:
             force_refresh: Force cookie extraction even if valid
             headless: Run browser in headless mode
             wait_time: Seconds to wait for API response
+            max_retries: Maximum retry attempts for cookie extraction
+            base_retry_delay: Base delay in seconds for retry backoff
 
         Returns:
             Tuple of (cookies, headers, referer)
+            
+        Raises:
+            CookieExpiredError: If cookie extraction fails after all retries
         """
         async with self.lock:
             # Load from file if not in memory
@@ -110,14 +174,74 @@ class CookieManager:
                 force_refresh or not self.cookies or not self._is_cookie_valid()
             )
 
-            if needs_refresh:
-                logger.info("Extracting fresh cookies...")
-                await self._extract_fresh_cookies(headless, wait_time)
-            else:
+            if not needs_refresh:
                 age = self._get_cookie_age()
                 logger.info(f"Using cached cookies (age: {age:.0f}s)")
+                # Reset failure counter on successful use
+                self.consecutive_failures = 0
+                return self.cookies, self.headers, self.referer
 
-            return self.cookies, self.headers, self.referer
+            # Try to extract with retries
+            logger.info("Extracting fresh cookies with retry logic...")
+            
+            for attempt in range(max_retries):
+                try:
+                    await self._extract_fresh_cookies(headless, wait_time)
+                    
+                    # Success! Reset failure tracking
+                    self.consecutive_failures = 0
+                    self.last_failure_time = None
+                    
+                    logger.success(f"✅ Cookie extraction successful (attempt {attempt + 1}/{max_retries})")
+                    return self.cookies, self.headers, self.referer
+                    
+                except CookieExpiredError as e:
+                    self.consecutive_failures += 1
+                    self.last_failure_time = datetime.now()
+                    
+                    error_msg = str(e)
+                    is_last_attempt = (attempt == max_retries - 1)
+                    
+                    logger.error(f"❌ Cookie extraction failed (attempt {attempt + 1}/{max_retries}): {error_msg}")
+                    
+                    if is_last_attempt:
+                        logger.error(f"🛑 All {max_retries} retry attempts exhausted")
+                        raise
+                    
+                    # Check if we're rate limited
+                    if self._is_rate_limited(error_msg):
+                        logger.warning(f"⚠️ Rate limiting detected (failure #{self.consecutive_failures})")
+                        
+                        # Clear old cookies - they might be flagged
+                        self._clear_cookies()
+                        
+                        # Calculate backoff
+                        backoff_delay = self._calculate_backoff(attempt, base_retry_delay)
+                        
+                        logger.warning(
+                            f"⏳ Backing off for {backoff_delay:.1f}s before retry "
+                            f"(attempt {attempt + 2}/{max_retries})..."
+                        )
+                        
+                        await asyncio.sleep(backoff_delay)
+                    else:
+                        # Non-rate-limit error, shorter backoff
+                        short_delay = 10.0
+                        logger.info(f"⏳ Waiting {short_delay}s before retry...")
+                        await asyncio.sleep(short_delay)
+                
+                except Exception as e:
+                    self.consecutive_failures += 1
+                    logger.error(f"❌ Unexpected error during cookie extraction: {e}")
+                    
+                    if attempt == max_retries - 1:
+                        raise CookieExpiredError(f"Cookie extraction failed after {max_retries} attempts: {e}")
+                    
+                    # Short delay for unexpected errors
+                    await asyncio.sleep(10.0)
+
+            # This shouldn't be reached, but just in case
+            raise CookieExpiredError(f"Cookie extraction failed after {max_retries} attempts")
 
     def _load_from_file(self) -> None:
         """Load cookies and headers from files"""
