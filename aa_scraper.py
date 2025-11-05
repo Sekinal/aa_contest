@@ -2,6 +2,7 @@
 """
 American Airlines Flight Scraper - Operation Point Break
 Production-ready async scraper with bot evasion and data storage
+Supports both Award (points) and Revenue (cash) searches
 """
 
 import argparse
@@ -9,15 +10,12 @@ import asyncio
 import json
 import logging
 import sys
-import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import httpx
-from tqdm.asyncio import tqdm
-
 
 # ============================================================================
 # Configuration
@@ -40,7 +38,6 @@ HEADERS = {
     "Sec-Fetch-Site": "same-origin",
 }
 
-
 # ============================================================================
 # Logging Setup
 # ============================================================================
@@ -51,7 +48,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
-
 
 # ============================================================================
 # Data Models
@@ -64,7 +60,6 @@ class FlightSegment:
     departure_time: str
     arrival_time: str
 
-
 @dataclass
 class FlightOption:
     """Complete flight option with pricing"""
@@ -75,7 +70,8 @@ class FlightOption:
     cash_price_usd: float
     taxes_fees_usd: float
     cpp: float
-
+    cabin_class: str
+    product_type: str
 
 @dataclass
 class SearchMetadata:
@@ -84,8 +80,7 @@ class SearchMetadata:
     destination: str
     date: str
     passengers: int
-    cabin_class: str
-
+    search_type: str  # "Award" or "Revenue"
 
 @dataclass
 class FlightSearchResult:
@@ -93,7 +88,6 @@ class FlightSearchResult:
     search_metadata: SearchMetadata
     flights: List[FlightOption]
     total_results: int
-
 
 # ============================================================================
 # Helper Functions
@@ -103,21 +97,12 @@ def utc_timestamp() -> str:
     """Get current UTC timestamp"""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-
 def ensure_directory(path: Path):
     """Create directory if it doesn't exist"""
     path.mkdir(parents=True, exist_ok=True)
 
-
 def load_cookies_from_file(cookie_file: Path) -> Dict[str, str]:
-    """
-    Load cookies from a file.
-    
-    Supported formats:
-    1. JSON: {"XSRF-TOKEN": "value", "JSESSIONID": "value"}
-    2. Netscape/curl format: name\tvalue (tab-separated)
-    3. Simple key=value pairs (one per line)
-    """
+    """Load cookies from a file (JSON format)"""
     cookies = {}
     
     if not cookie_file.exists():
@@ -126,33 +111,13 @@ def load_cookies_from_file(cookie_file: Path) -> Dict[str, str]:
     
     content = cookie_file.read_text(encoding="utf-8").strip()
     
-    # Try JSON format first
     try:
         cookies = json.loads(content)
         logger.info(f"Loaded {len(cookies)} cookies from JSON file")
         return cookies
     except json.JSONDecodeError:
-        pass
-    
-    # Try line-by-line formats
-    for line in content.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        
-        # Try tab-separated (Netscape format)
-        if "\t" in line:
-            parts = line.split("\t")
-            if len(parts) >= 7:
-                cookies[parts[5]] = parts[6]
-        # Try key=value format
-        elif "=" in line:
-            key, value = line.split("=", 1)
-            cookies[key.strip()] = value.strip()
-    
-    logger.info(f"Loaded {len(cookies)} cookies from file")
-    return cookies
-
+        logger.error("Failed to parse cookie file as JSON")
+        return cookies
 
 def format_duration(minutes: int) -> str:
     """Convert minutes to 'Xh Ym' format"""
@@ -160,13 +125,11 @@ def format_duration(minutes: int) -> str:
     mins = minutes % 60
     return f"{hours}h {mins}m"
 
-
 def calculate_cpp(cash_price: float, taxes_fees: float, points: int) -> float:
     """Calculate cents per point (CPP)"""
     if points == 0:
         return 0.0
     return round((cash_price - taxes_fees) / points * 100, 2)
-
 
 # ============================================================================
 # Rate Limiting
@@ -198,7 +161,6 @@ class RateLimiter:
             await asyncio.sleep(wait_time)
             self.tokens = 0.0
 
-
 # ============================================================================
 # API Client
 # ============================================================================
@@ -220,11 +182,10 @@ class AAFlightClient:
         self.headers = HEADERS.copy()
         if "XSRF-TOKEN" in cookies:
             self.headers["X-XSRF-TOKEN"] = cookies["XSRF-TOKEN"]
-
         if "spa_session_id" in cookies:
             self.headers["X-CID"] = cookies["spa_session_id"]
         
-        # Use a valid referrer (from the browser when you captured cookies)
+        # Use a valid referrer
         self.headers["Referer"] = "https://www.aa.com/booking/choose-flights/1"
     
     def _build_request_payload(
@@ -232,14 +193,17 @@ class AAFlightClient:
         origin: str,
         destination: str,
         date: str,
-        passengers: int = 1
+        passengers: int = 1,
+        search_type: str = "Award"
     ) -> Dict[str, Any]:
         """Build the API request payload"""
-        return {
+        
+        # Base payload structure
+        payload = {
             "metadata": {
                 "selectedProducts": [],
                 "tripType": "OneWay",
-                "udo": {}  # ← Added
+                "udo": {}
             },
             "passengers": [
                 {
@@ -253,7 +217,7 @@ class AAFlightClient:
             "slices": [
                 {
                     "allCarriers": True,
-                    "cabin": "",  # ← Changed from {} to ""
+                    "cabin": "",
                     "connectionCity": None,
                     "departureDate": date,
                     "destination": destination,
@@ -267,12 +231,12 @@ class AAFlightClient:
                 "corporateBooking": False,
                 "fareType": "Lowest",
                 "locale": "en_US",
-                "pointOfSale": "",  # ← Added
-                "searchType": "Award"
+                "pointOfSale": "",
+                "searchType": search_type  # "Award" or "Revenue"
             },
-            "loyaltyInfo": None,  # ← Added
-            "version": "",  # ← Added
-            "queryParams": {  # ← Added all missing fields
+            "loyaltyInfo": None,
+            "version": "cfr" if search_type == "Revenue" else "",
+            "queryParams": {
                 "sliceIndex": 0,
                 "sessionId": "",
                 "solutionSet": "",
@@ -280,19 +244,25 @@ class AAFlightClient:
                 "sort": "CARRIER"
             }
         }
-
+        
+        # Add search_method for Revenue searches
+        if search_type == "Revenue":
+            payload["metadata"]["udo"]["search_method"] = "Lowest"
+        
+        return payload
     
     async def search_flights(
         self,
         origin: str,
         destination: str,
         date: str,
-        passengers: int = 1
+        passengers: int = 1,
+        search_type: str = "Award"
     ) -> Optional[Dict[str, Any]]:
         """Search for flights"""
         await self.rate_limiter.acquire()
         
-        payload = self._build_request_payload(origin, destination, date, passengers)
+        payload = self._build_request_payload(origin, destination, date, passengers, search_type)
         
         limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
         timeout = httpx.Timeout(self.timeout)
@@ -307,12 +277,12 @@ class AAFlightClient:
             follow_redirects=False
         ) as client:
             try:
-                logger.info(f"Searching flights: {origin} → {destination} on {date}")
+                logger.info(f"Searching {search_type} flights: {origin} → {destination} on {date}")
                 response = await client.post(API_ENDPOINT, json=payload)
                 response.raise_for_status()
                 
                 data = response.json()
-                logger.info(f"✓ Search successful - {len(data.get('slices', []))} flights found")
+                logger.info(f"✓ {search_type} search successful - {len(data.get('slices', []))} flights found")
                 return data
                 
             except httpx.HTTPStatusError as e:
@@ -327,7 +297,6 @@ class AAFlightClient:
                 logger.error(f"Request failed: {e}")
                 return None
 
-
 # ============================================================================
 # Data Parser
 # ============================================================================
@@ -336,36 +305,10 @@ class FlightDataParser:
     """Parse AA API response into structured data"""
     
     @staticmethod
-    def parse_segments(segments_data: List[Dict]) -> List[FlightSegment]:
-        """Parse flight segments"""
-        segments = []
-        for seg in segments_data:
-            flight = seg.get("flight", {})
-            flight_num = f"{flight.get('carrierCode', '')}{flight.get('flightNumber', '')}"
-            
-            # Get first leg times (segments contain legs)
-            legs = seg.get("legs", [])
-            if legs:
-                leg = legs[0]
-                departure = leg.get("departureDateTime", "")
-                arrival = leg.get("arrivalDateTime", "")
-                
-                # Extract just the time (HH:MM)
-                dep_time = departure.split("T")[1][:5] if "T" in departure else ""
-                arr_time = arrival.split("T")[1][:5] if "T" in arrival else ""
-                
-                segments.append(FlightSegment(
-                    flight_number=flight_num,
-                    departure_time=dep_time,
-                    arrival_time=arr_time
-                ))
-        
-        return segments
-    
-    @staticmethod
     def parse_flight_options(
         api_response: Dict[str, Any],
-        cabin_class: str = "COACH"
+        cabin_filter: str = "COACH",
+        search_type: str = "Award"
     ) -> List[FlightOption]:
         """
         Parse flight options from API response.
@@ -390,37 +333,45 @@ class FlightDataParser:
             origin = slice_data.get("origin", {}).get("code", "")
             destination = slice_data.get("destination", {}).get("code", "")
             
-            # Iterate through product pricing options (COACH, BUSINESS, FIRST, etc.)
-            product_pricing = slice_data.get("productPricing", [])
+            # Iterate through product pricing options
+            pricing_detail = slice_data.get("pricingDetail", [])
             
-            for pricing_option in product_pricing:
-                # Use cheapestPrice if available, otherwise regularPrice
-                price_info = pricing_option.get("cheapestPrice") or pricing_option.get("regularPrice")
-                
-                if not price_info:
-                    continue
-                
-                # Check if this matches requested cabin class
-                product_type = price_info.get("productType", "")
-                if product_type != cabin_class:
-                    continue
-                
+            for pricing_option in pricing_detail:
                 # Check if product is available
-                if not price_info.get("productAvailable", False):
+                if not pricing_option.get("productAvailable", False):
                     continue
+                
+                # Get product type
+                product_type = pricing_option.get("productType", "")
+                product_group = pricing_option.get("productGroup", "")
+                
+                # Filter by cabin class (match on product_type)
+                if cabin_filter:
+                    # Match COACH, BUSINESS, FIRST, etc.
+                    if not product_type.startswith(cabin_filter):
+                        continue
                 
                 # Extract pricing information from slicePricing
-                slice_pricing = price_info.get("slicePricing", {})
+                slice_pricing = pricing_option.get("slicePricing", {})
                 
                 if not slice_pricing:
                     continue
                 
-                # Points required
+                # Points required (for Award searches, this will be actual points)
+                # For Revenue searches, perPassengerAwardPoints contains fare amount as string
                 points_str = slice_pricing.get("perPassengerAwardPoints", "0")
                 if isinstance(points_str, str):
-                    points = int(float(points_str.replace(",", "")))
+                    points_or_fare = float(points_str.replace(",", ""))
                 else:
-                    points = int(points_str)
+                    points_or_fare = float(points_str)
+                
+                # For Award: points_or_fare is points, for Revenue: it's base fare
+                if search_type == "Award":
+                    points = int(points_or_fare)
+                    fare_amount = 0.0
+                else:
+                    points = 0
+                    fare_amount = points_or_fare
                 
                 # Taxes and fees
                 taxes_fees = slice_pricing.get("allPassengerDisplayTaxTotal", {}).get("amount", 0.0)
@@ -428,12 +379,15 @@ class FlightDataParser:
                 # Total price
                 cash_total = slice_pricing.get("allPassengerDisplayTotal", {}).get("amount", 0.0)
                 
-                # Calculate CPP
-                cpp = calculate_cpp(cash_total, taxes_fees, points)
+                # Calculate CPP (only meaningful for Award)
+                if search_type == "Award":
+                    cpp = calculate_cpp(cash_total, taxes_fees, points)
+                else:
+                    cpp = 0.0
                 
                 # Create flight segment
                 segments = [FlightSegment(
-                    flight_number=f"{origin}{destination}",
+                    flight_number=f"{origin}-{destination}",
                     departure_time=dep_time,
                     arrival_time=arr_time
                 )]
@@ -445,14 +399,14 @@ class FlightDataParser:
                     points_required=points,
                     cash_price_usd=cash_total,
                     taxes_fees_usd=taxes_fees,
-                    cpp=cpp
+                    cpp=cpp,
+                    cabin_class=product_group,
+                    product_type=product_type
                 )
                 
                 flights.append(flight)
         
         return flights
-
-
 
 # ============================================================================
 # Main Scraper
@@ -464,106 +418,159 @@ async def scrape_flights(
     date: str,
     passengers: int,
     cookies: Dict[str, str],
+    cabin_filter: str = "COACH",
+    search_types: List[str] = ["Award", "Revenue"],
     rate_limit: float = 1.0
-) -> Optional[FlightSearchResult]:
+) -> Dict[str, Optional[FlightSearchResult]]:
     """
-    Main scraping function
-    
-    Args:
-        origin: Origin airport code (e.g., 'LAX')
-        destination: Destination airport code (e.g., 'JFK')
-        date: Departure date in YYYY-MM-DD format
-        passengers: Number of passengers
-        cookies: Cookie dictionary
-        rate_limit: Requests per second
+    Main scraping function - scrapes both Award and Revenue searches
     
     Returns:
-        FlightSearchResult or None
+        Dictionary with keys "Award" and "Revenue" containing results
     """
     rate_limiter = RateLimiter(rate=rate_limit, burst=int(rate_limit * 2))
     client = AAFlightClient(cookies, rate_limiter)
     
-    # Search flights
-    api_response = await client.search_flights(origin, destination, date, passengers)
+    results = {}
     
-    if not api_response:
-        return None
+    for search_type in search_types:
+        # Search flights
+        api_response = await client.search_flights(
+            origin, destination, date, passengers, search_type
+        )
+        
+        if not api_response:
+            results[search_type] = None
+            continue
+        
+        # Parse response
+        flights = FlightDataParser.parse_flight_options(
+            api_response, 
+            cabin_filter=cabin_filter,
+            search_type=search_type
+        )
+        
+        if not flights:
+            logger.warning(f"No {cabin_filter} flights found in {search_type} response")
+            results[search_type] = None
+            continue
+        
+        # Build result
+        metadata = SearchMetadata(
+            origin=origin,
+            destination=destination,
+            date=date,
+            passengers=passengers,
+            search_type=search_type
+        )
+        
+        result = FlightSearchResult(
+            search_metadata=asdict(metadata),
+            flights=[asdict(f) for f in flights],
+            total_results=len(flights)
+        )
+        
+        results[search_type] = result
     
-    # Parse response
-    flights = FlightDataParser.parse_flight_options(api_response)
-    
-    if not flights:
-        logger.warning("No Main Cabin flights found in response")
-        return None
-    
-    # Build result
-    metadata = SearchMetadata(
-        origin=origin,
-        destination=destination,
-        date=date,
-        passengers=passengers,
-        cabin_class="economy"
-    )
-    
-    result = FlightSearchResult(
-        search_metadata=asdict(metadata),
-        flights=[asdict(f) for f in flights],
-        total_results=len(flights)
-    )
-    
-    return result
-
+    return results
 
 # ============================================================================
 # Storage
 # ============================================================================
 
 def save_results(
-    result: FlightSearchResult,
+    results: Dict[str, Optional[FlightSearchResult]],
     output_dir: Path,
-    format: str = "json"
+    origin: str,
+    destination: str,
+    date: str
 ):
-    """
-    Save scraping results
-    
-    Args:
-        result: FlightSearchResult to save
-        output_dir: Output directory
-        format: 'json' or 'jsonl'
-    """
+    """Save scraping results with Award and Revenue data properly merged"""
     ensure_directory(output_dir)
     
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    metadata = result.search_metadata
-    filename = f"{metadata['origin']}_{metadata['destination']}_{metadata['date']}_{timestamp}"
+    base_filename = f"{origin}_{destination}_{date}_{timestamp}"
     
-    result_dict = asdict(result)
+    # Convert FlightSearchResult objects to dictionaries
+    award_result = asdict(results["Award"]) if results.get("Award") else None
+    revenue_result = asdict(results["Revenue"]) if results.get("Revenue") else None
     
-    if format == "json":
-        output_file = output_dir / f"{filename}.json"
-        output_file.write_text(
-            json.dumps(result_dict, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
-        logger.info(f"✓ Saved JSON: {output_file}")
+    # Create a merged flight list
+    merged_flights = []
     
-    elif format == "jsonl":
-        output_file = output_dir / f"{filename}.jsonl"
-        with output_file.open("w", encoding="utf-8") as f:
-            for flight in result.flights:
-                f.write(json.dumps(flight, ensure_ascii=False) + "\n")
-        logger.info(f"✓ Saved JSONL: {output_file}")
+    if award_result and revenue_result:
+        # Create a lookup dict for revenue flights - ONLY exact "COACH" product type
+        revenue_lookup = {}
+        for flight in revenue_result["flights"]:
+            # Filter: Only include exact "COACH" product type
+            if flight["product_type"] != "COACH":
+                continue
+                
+            dep_time = flight["segments"][0]["departure_time"]
+            arr_time = flight["segments"][0]["arrival_time"]
+            nonstop = flight["is_nonstop"]
+            key = (dep_time, arr_time, nonstop)
+            
+            if key not in revenue_lookup:
+                revenue_lookup[key] = flight
+        
+        # Merge Award flights with Revenue data - ONLY exact "COACH"
+        for award_flight in award_result["flights"]:
+            # Filter: Only include exact "COACH" product type
+            if award_flight["product_type"] != "COACH":
+                continue
+            
+            dep_time = award_flight["segments"][0]["departure_time"]
+            arr_time = award_flight["segments"][0]["arrival_time"]
+            nonstop = award_flight["is_nonstop"]
+            key = (dep_time, arr_time, nonstop)
+            
+            if key in revenue_lookup:
+                revenue_flight = revenue_lookup[key]
+                # Merge: keep award points AND taxes/fees, add revenue cash price
+                merged_flight = award_flight.copy()
+                merged_flight["cash_price_usd"] = revenue_flight["cash_price_usd"]
+                # taxes_fees_usd stays from award_flight
+                
+                # Recalculate CPP with revenue cash price and award taxes/fees
+                if merged_flight["points_required"] > 0:
+                    merged_flight["cpp"] = calculate_cpp(
+                        revenue_flight["cash_price_usd"],
+                        award_flight["taxes_fees_usd"],
+                        merged_flight["points_required"]
+                    )
+            else:
+                merged_flight = award_flight.copy()
+            
+            merged_flights.append(merged_flight)
     
-    # Also save metadata separately
-    meta_file = output_dir / f"{filename}_metadata.json"
-    meta_file.write_text(
-        json.dumps({
-            "search_metadata": result.search_metadata,
-            "total_results": result.total_results,
-            "scraped_at": utc_timestamp()
-        }, ensure_ascii=False, indent=2),
+    elif award_result:
+        # Filter for exact "COACH" only
+        merged_flights = [f for f in award_result["flights"] if f["product_type"] == "COACH"]
+    elif revenue_result:
+        # Filter for exact "COACH" only
+        merged_flights = [f for f in revenue_result["flights"] if f["product_type"] == "COACH"]
+    
+    # Build the final merged result
+    merged_result = {
+        "search_metadata": {
+            "origin": origin.upper(),
+            "destination": destination.upper(),
+            "date": date,
+            "passengers": 1,
+            "search_types": [k for k, v in results.items() if v is not None]
+        },
+        "flights": merged_flights,
+        "total_results": len(merged_flights)
+    }
+    
+    # Save ONLY the single merged file
+    output_file = output_dir / f"{base_filename}_combined.json"
+    output_file.write_text(
+        json.dumps(merged_result, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
+    logger.info(f"✓ Saved merged results: {output_file}")
 
 
 # ============================================================================
@@ -572,87 +579,31 @@ def save_results(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="American Airlines Flight Scraper - Operation Point Break",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Basic search with cookie file
-  python aa_scraper.py --origin LAX --destination JFK --date 2025-12-15 --cookies cookies.json
-  
-  # With custom output directory
-  python aa_scraper.py --origin LAX --destination JFK --date 2025-12-15 --cookies cookies.json --output ./data
-  
-  # Lower rate limit for safety
-  python aa_scraper.py --origin LAX --destination JFK --date 2025-12-15 --cookies cookies.json --rate-limit 0.5
-
-Cookie File Formats:
-  1. JSON: {"XSRF-TOKEN": "abc", "JSESSIONID": "xyz", "_abck": "..."}
-  2. Key=Value: One cookie per line (XSRF-TOKEN=abc)
-  3. Netscape/curl format: Tab-separated values
-        """
+        description="American Airlines Flight Scraper - Award & Revenue",
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
     # Required arguments
-    parser.add_argument(
-        "--origin",
-        type=str,
-        required=True,
-        help="Origin airport code (e.g., LAX)"
-    )
-    parser.add_argument(
-        "--destination",
-        type=str,
-        required=True,
-        help="Destination airport code (e.g., JFK)"
-    )
-    parser.add_argument(
-        "--date",
-        type=str,
-        required=True,
-        help="Departure date (YYYY-MM-DD)"
-    )
-    parser.add_argument(
-        "--cookies",
-        type=str,
-        required=True,
-        help="Path to cookies file (JSON or text format)"
-    )
+    parser.add_argument("--origin", type=str, required=True, help="Origin airport code")
+    parser.add_argument("--destination", type=str, required=True, help="Destination airport code")
+    parser.add_argument("--date", type=str, required=True, help="Departure date (YYYY-MM-DD)")
+    parser.add_argument("--cookies", type=str, required=True, help="Path to cookies JSON file")
     
     # Optional arguments
-    parser.add_argument(
-        "--passengers",
-        type=int,
-        default=1,
-        help="Number of passengers (default: 1)"
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="./output",
-        help="Output directory (default: ./output)"
-    )
-    parser.add_argument(
-        "--format",
-        type=str,
-        choices=["json", "jsonl"],
-        default="json",
-        help="Output format (default: json)"
-    )
-    parser.add_argument(
-        "--rate-limit",
-        type=float,
-        default=1.0,
-        help="Requests per second (default: 1.0)"
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable debug logging"
-    )
+    parser.add_argument("--passengers", type=int, default=1, help="Number of passengers")
+    parser.add_argument("--cabin", type=str, default="COACH", 
+                       choices=["COACH", "BUSINESS", "FIRST", "PREMIUM_ECONOMY"],
+                       help="Cabin class filter")
+    parser.add_argument("--search-type", type=str, nargs="+", 
+                       default=["Award", "Revenue"],
+                       choices=["Award", "Revenue"],
+                       help="Search types to perform")
+    parser.add_argument("--output", type=str, default="./output", help="Output directory")
+    parser.add_argument("--rate-limit", type=float, default=1.0, help="Requests per second")
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     
     args = parser.parse_args()
     
-    # Configure logging
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
     
@@ -662,48 +613,41 @@ Cookie File Formats:
     
     if not cookies:
         logger.error("❌ No cookies loaded - cannot proceed")
-        logger.info("\nTo get cookies:")
-        logger.info("1. Visit https://www.aa.com in your browser")
-        logger.info("2. Open DevTools (F12) → Application → Cookies")
-        logger.info("3. Export cookies to JSON format")
-        logger.info("4. Save critical cookies: XSRF-TOKEN, JSESSIONID, _abck, bm_sv, etc.")
         sys.exit(1)
-    
-    # Validate required cookies
-    required_cookies = ["XSRF-TOKEN", "JSESSIONID"]
-    missing = [c for c in required_cookies if c not in cookies]
-    if missing:
-        logger.warning(f"⚠️ Missing recommended cookies: {', '.join(missing)}")
-        logger.warning("Scraper may fail without these cookies")
     
     # Run scraper
     output_dir = Path(args.output)
     
     async def run():
-        result = await scrape_flights(
+        results = await scrape_flights(
             origin=args.origin.upper(),
             destination=args.destination.upper(),
             date=args.date,
             passengers=args.passengers,
             cookies=cookies,
+            cabin_filter=args.cabin,
+            search_types=args.search_type,
             rate_limit=args.rate_limit
         )
         
-        if result:
-            save_results(result, output_dir, args.format)
-            logger.info(f"\n{'='*60}")
-            logger.info(f"✓ Scraping complete!")
-            logger.info(f"  Route: {args.origin} → {args.destination}")
-            logger.info(f"  Date: {args.date}")
-            logger.info(f"  Flights found: {result.total_results}")
-            logger.info(f"  Output: {output_dir}")
-            logger.info(f"{'='*60}\n")
-        else:
-            logger.error("❌ Scraping failed")
+        # Check if we got any results
+        if not any(results.values()):
+            logger.error("❌ All searches failed")
             sys.exit(1)
+        
+        save_results(results, output_dir, args.origin, args.destination, args.date)
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"✓ Scraping complete!")
+        logger.info(f"  Route: {args.origin} → {args.destination}")
+        logger.info(f"  Date: {args.date}")
+        for search_type, result in results.items():
+            if result:
+                logger.info(f"  {search_type}: {result.total_results} flights found")
+        logger.info(f"  Output: {output_dir}")
+        logger.info(f"{'='*60}\n")
     
     asyncio.run(run())
-
 
 if __name__ == "__main__":
     main()
