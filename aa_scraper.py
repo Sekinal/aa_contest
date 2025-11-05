@@ -5,6 +5,7 @@ Production-ready async scraper with bot evasion and data storage
 Supports both Award (points) and Revenue (cash) searches
 """
 
+
 import argparse
 import asyncio
 import json
@@ -15,14 +16,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+
 import httpx
+
 
 # ============================================================================
 # Configuration
 # ============================================================================
 
+
 API_ENDPOINT = "https://www.aa.com/booking/api/search/itinerary"
 BASE_URL = "https://www.aa.com"
+
 
 # Realistic Firefox headers
 HEADERS = {
@@ -38,9 +43,11 @@ HEADERS = {
     "Sec-Fetch-Site": "same-origin",
 }
 
+
 # ============================================================================
 # Logging Setup
 # ============================================================================
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,9 +56,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 # ============================================================================
 # Data Models
 # ============================================================================
+
 
 @dataclass
 class FlightSegment:
@@ -59,6 +68,7 @@ class FlightSegment:
     flight_number: str
     departure_time: str
     arrival_time: str
+
 
 @dataclass
 class FlightOption:
@@ -73,6 +83,7 @@ class FlightOption:
     cabin_class: str
     product_type: str
 
+
 @dataclass
 class SearchMetadata:
     """Search parameters"""
@@ -82,6 +93,7 @@ class SearchMetadata:
     passengers: int
     search_type: str  # "Award" or "Revenue"
 
+
 @dataclass
 class FlightSearchResult:
     """Complete search result"""
@@ -89,17 +101,21 @@ class FlightSearchResult:
     flights: List[FlightOption]
     total_results: int
 
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
+
 
 def utc_timestamp() -> str:
     """Get current UTC timestamp"""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+
 def ensure_directory(path: Path):
     """Create directory if it doesn't exist"""
     path.mkdir(parents=True, exist_ok=True)
+
 
 def load_cookies_from_file(cookie_file: Path) -> Dict[str, str]:
     """Load cookies from a file (JSON format)"""
@@ -119,11 +135,13 @@ def load_cookies_from_file(cookie_file: Path) -> Dict[str, str]:
         logger.error("Failed to parse cookie file as JSON")
         return cookies
 
+
 def format_duration(minutes: int) -> str:
     """Convert minutes to 'Xh Ym' format"""
     hours = minutes // 60
     mins = minutes % 60
     return f"{hours}h {mins}m"
+
 
 def calculate_cpp(cash_price: float, taxes_fees: float, points: int) -> float:
     """Calculate cents per point (CPP)"""
@@ -131,9 +149,11 @@ def calculate_cpp(cash_price: float, taxes_fees: float, points: int) -> float:
         return 0.0
     return round((cash_price - taxes_fees) / points * 100, 2)
 
+
 # ============================================================================
 # Rate Limiting
 # ============================================================================
+
 
 class RateLimiter:
     """Token bucket rate limiter"""
@@ -161,9 +181,11 @@ class RateLimiter:
             await asyncio.sleep(wait_time)
             self.tokens = 0.0
 
+
 # ============================================================================
 # API Client
 # ============================================================================
+
 
 class AAFlightClient:
     """American Airlines flight search client"""
@@ -297,9 +319,11 @@ class AAFlightClient:
                 logger.error(f"Request failed: {e}")
                 return None
 
+
 # ============================================================================
 # Data Parser
 # ============================================================================
+
 
 class FlightDataParser:
     """Parse AA API response into structured data"""
@@ -408,9 +432,11 @@ class FlightDataParser:
         
         return flights
 
+
 # ============================================================================
 # Main Scraper
 # ============================================================================
+
 
 async def scrape_flights(
     origin: str,
@@ -421,23 +447,29 @@ async def scrape_flights(
     cabin_filter: str = "COACH",
     search_types: List[str] = ["Award", "Revenue"],
     rate_limit: float = 1.0
-) -> Dict[str, Optional[FlightSearchResult]]:
+) -> tuple[Dict[str, Optional[FlightSearchResult]], Dict[str, Optional[Dict[str, Any]]]]:
     """
     Main scraping function - scrapes both Award and Revenue searches
     
     Returns:
-        Dictionary with keys "Award" and "Revenue" containing results
+        Tuple of:
+        - Dictionary with keys "Award" and "Revenue" containing parsed results
+        - Dictionary with keys "Award" and "Revenue" containing raw API responses
     """
     rate_limiter = RateLimiter(rate=rate_limit, burst=int(rate_limit * 2))
     client = AAFlightClient(cookies, rate_limiter)
     
     results = {}
+    raw_responses = {}
     
     for search_type in search_types:
         # Search flights
         api_response = await client.search_flights(
             origin, destination, date, passengers, search_type
         )
+        
+        # Store raw response
+        raw_responses[search_type] = api_response
         
         if not api_response:
             results[search_type] = None
@@ -472,24 +504,47 @@ async def scrape_flights(
         
         results[search_type] = result
     
-    return results
+    return results, raw_responses
+
 
 # ============================================================================
 # Storage
 # ============================================================================
 
+
 def save_results(
     results: Dict[str, Optional[FlightSearchResult]],
+    raw_responses: Dict[str, Optional[Dict[str, Any]]],
     output_dir: Path,
     origin: str,
     destination: str,
     date: str
 ):
-    """Save scraping results with Award and Revenue data properly merged"""
+    """Save scraping results with Award and Revenue data properly merged, plus raw responses"""
     ensure_directory(output_dir)
+    
+    # Create raw data subdirectory
+    raw_dir = output_dir / "raw_data"
+    ensure_directory(raw_dir)
     
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     base_filename = f"{origin}_{destination}_{date}_{timestamp}"
+    
+    # ========================================================================
+    # Save raw API responses
+    # ========================================================================
+    for search_type, raw_data in raw_responses.items():
+        if raw_data is not None:
+            raw_file = raw_dir / f"{base_filename}_{search_type.lower()}_raw.json"
+            raw_file.write_text(
+                json.dumps(raw_data, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+            logger.info(f"✓ Saved raw {search_type} response: {raw_file}")
+    
+    # ========================================================================
+    # Process and save merged results (existing logic)
+    # ========================================================================
     
     # Convert FlightSearchResult objects to dictionaries
     award_result = asdict(results["Award"]) if results.get("Award") else None
@@ -577,6 +632,7 @@ def save_results(
 # CLI
 # ============================================================================
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="American Airlines Flight Scraper - Award & Revenue",
@@ -619,7 +675,7 @@ def main():
     output_dir = Path(args.output)
     
     async def run():
-        results = await scrape_flights(
+        results, raw_responses = await scrape_flights(
             origin=args.origin.upper(),
             destination=args.destination.upper(),
             date=args.date,
@@ -635,7 +691,7 @@ def main():
             logger.error("❌ All searches failed")
             sys.exit(1)
         
-        save_results(results, output_dir, args.origin, args.destination, args.date)
+        save_results(results, raw_responses, output_dir, args.origin, args.destination, args.date)
         
         logger.info(f"\n{'='*60}")
         logger.info(f"✓ Scraping complete!")
@@ -645,9 +701,11 @@ def main():
             if result:
                 logger.info(f"  {search_type}: {result.total_results} flights found")
         logger.info(f"  Output: {output_dir}")
+        logger.info(f"  Raw data: {output_dir / 'raw_data'}")
         logger.info(f"{'='*60}\n")
     
     asyncio.run(run())
+
 
 if __name__ == "__main__":
     main()
