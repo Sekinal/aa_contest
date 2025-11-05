@@ -542,7 +542,7 @@ def save_results(
             logger.info(f"✓ Saved raw {search_type} response: {raw_file}")
     
     # ========================================================================
-    # Process and save merged results
+    # Process and save merged results (ONLY if we have both Award and Revenue)
     # ========================================================================
     
     award_flights = results.get("Award")
@@ -558,6 +558,12 @@ def save_results(
             # Filter: Only include exact "COACH" product type
             if flight.get("_product_type") != "COACH":
                 continue
+            
+            # Skip if no valid cash price (must be > 0)
+            cash_price = flight.get("cash_price_usd", 0.0)
+            if cash_price <= 0:
+                logger.debug(f"Skipping revenue flight with invalid cash_price_usd: {cash_price}")
+                continue
                 
             # Create key based on segments
             segments = flight["segments"]
@@ -571,6 +577,8 @@ def save_results(
             
             if key not in revenue_lookup:
                 revenue_lookup[key] = flight
+        
+        logger.info(f"Found {len(revenue_lookup)} valid revenue flights with pricing")
         
         # Merge Award flights with Revenue data - ONLY exact "COACH"
         for award_flight in award_flights:
@@ -587,6 +595,7 @@ def save_results(
             nonstop = award_flight["is_nonstop"]
             key = (dep_time, arr_time, nonstop)
             
+            # ONLY include if we found a matching revenue flight with valid price
             if key in revenue_lookup:
                 revenue_flight = revenue_lookup[key]
                 # Merge: keep award points AND taxes/fees, add revenue cash price
@@ -601,27 +610,30 @@ def save_results(
                         award_flight["taxes_fees_usd"],
                         merged_flight["points_required"]
                     )
+                
+                # Remove temporary product_type field
+                merged_flight.pop("_product_type", None)
+                merged_flights.append(merged_flight)
             else:
-                merged_flight = award_flight.copy()
-            
-            # Remove temporary product_type field
-            merged_flight.pop("_product_type", None)
-            merged_flights.append(merged_flight)
+                # Skip this award flight - no matching revenue data with valid price
+                logger.debug(f"Skipping award flight - no matching revenue data: {dep_time} -> {arr_time}")
     
-    elif award_flights:
-        # Filter for exact "COACH" only
-        merged_flights = [
-            {k: v for k, v in f.items() if k != "_product_type"}
-            for f in award_flights 
-            if f.get("_product_type") == "COACH"
-        ]
-    elif revenue_flights:
-        # Filter for exact "COACH" only
-        merged_flights = [
-            {k: v for k, v in f.items() if k != "_product_type"}
-            for f in revenue_flights 
-            if f.get("_product_type") == "COACH"
-        ]
+    elif award_flights and not revenue_flights:
+        # If only award data, we can't include any flights since we need revenue prices
+        logger.warning("⚠️ No revenue data available - cannot calculate CPP. No flights will be saved.")
+        logger.warning("   Please ensure both Award and Revenue searches are successful.")
+        merged_flights = []
+    
+    elif revenue_flights and not award_flights:
+        # If only revenue data, we don't have points information
+        logger.warning("⚠️ No award data available - cannot calculate CPP. No flights will be saved.")
+        logger.warning("   Please ensure both Award and Revenue searches are successful.")
+        merged_flights = []
+    
+    else:
+        # Neither search succeeded
+        logger.error("❌ No flight data available from either search")
+        merged_flights = []
     
     # Build the final merged result
     merged_result = {
@@ -642,7 +654,13 @@ def save_results(
         json.dumps(merged_result, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
-    logger.info(f"✓ Saved merged results: {output_file}")
+    
+    if merged_flights:
+        logger.info(f"✓ Saved merged results: {output_file}")
+        logger.info(f"  {len(merged_flights)} flights included (with valid revenue pricing)")
+    else:
+        logger.warning(f"⚠️ Saved empty results: {output_file}")
+        logger.warning(f"  No flights matched between Award and Revenue searches")
 
 
 # ============================================================================
