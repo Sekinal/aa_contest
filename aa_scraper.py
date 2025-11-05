@@ -44,6 +44,15 @@ HEADERS = {
 }
 
 
+# Cabin class mapping
+CABIN_CLASS_MAP = {
+    "COACH": "economy",
+    "BUSINESS": "business",
+    "FIRST": "first",
+    "PREMIUM_ECONOMY": "premium_economy"
+}
+
+
 # ============================================================================
 # Logging Setup
 # ============================================================================
@@ -74,14 +83,12 @@ class FlightSegment:
 class FlightOption:
     """Complete flight option with pricing"""
     is_nonstop: bool
-    segments: List[FlightSegment]
+    segments: List[Dict[str, str]]  # List of segment dicts
     total_duration: str
     points_required: int
     cash_price_usd: float
     taxes_fees_usd: float
     cpp: float
-    cabin_class: str
-    product_type: str
 
 
 @dataclass
@@ -91,15 +98,7 @@ class SearchMetadata:
     destination: str
     date: str
     passengers: int
-    search_type: str  # "Award" or "Revenue"
-
-
-@dataclass
-class FlightSearchResult:
-    """Complete search result"""
-    search_metadata: SearchMetadata
-    flights: List[FlightOption]
-    total_results: int
+    cabin_class: str  # Changed from search_type
 
 
 # ============================================================================
@@ -148,6 +147,14 @@ def calculate_cpp(cash_price: float, taxes_fees: float, points: int) -> float:
     if points == 0:
         return 0.0
     return round((cash_price - taxes_fees) / points * 100, 2)
+
+
+def format_time(datetime_str: str) -> str:
+    """Extract time from ISO datetime string (HH:MM format)"""
+    if "T" not in datetime_str:
+        return ""
+    time_part = datetime_str.split("T")[1]
+    return time_part[:5]  # HH:MM
 
 
 # ============================================================================
@@ -333,10 +340,11 @@ class FlightDataParser:
         api_response: Dict[str, Any],
         cabin_filter: str = "COACH",
         search_type: str = "Award"
-    ) -> List[FlightOption]:
+    ) -> List[Dict[str, Any]]:
         """
         Parse flight options from API response.
         Filters for specified cabin class.
+        Returns list of flight dicts (not dataclass instances).
         """
         flights = []
         slices = api_response.get("slices", [])
@@ -347,15 +355,29 @@ class FlightDataParser:
             duration_str = format_duration(duration_min)
             is_nonstop = slice_data.get("stops", 0) == 0
             
-            # Get departure/arrival times
-            departure_dt = slice_data.get("departureDateTime", "")
-            arrival_dt = slice_data.get("arrivalDateTime", "")
+            # Parse segments - extract actual flight numbers
+            segments_data = slice_data.get("segments", [])
+            parsed_segments = []
             
-            dep_time = departure_dt.split("T")[1][:5] if "T" in departure_dt else ""
-            arr_time = arrival_dt.split("T")[1][:5] if "T" in arrival_dt else ""
+            for segment in segments_data:
+                # Get flight info
+                flight_info = segment.get("flight", {})
+                carrier_code = flight_info.get("carrierCode", "")
+                flight_num = flight_info.get("flightNumber", "")
+                flight_number = f"{carrier_code}{flight_num}"
+                
+                # Get times
+                dep_time = format_time(segment.get("departureDateTime", ""))
+                arr_time = format_time(segment.get("arrivalDateTime", ""))
+                
+                parsed_segments.append({
+                    "flight_number": flight_number,
+                    "departure_time": dep_time,
+                    "arrival_time": arr_time
+                })
             
-            origin = slice_data.get("origin", {}).get("code", "")
-            destination = slice_data.get("destination", {}).get("code", "")
+            if not parsed_segments:
+                continue
             
             # Iterate through product pricing options
             pricing_detail = slice_data.get("pricingDetail", [])
@@ -367,13 +389,12 @@ class FlightDataParser:
                 
                 # Get product type
                 product_type = pricing_option.get("productType", "")
-                product_group = pricing_option.get("productGroup", "")
                 
-                # Filter by cabin class (match on product_type)
-                if cabin_filter:
-                    # Match COACH, BUSINESS, FIRST, etc.
-                    if not product_type.startswith(cabin_filter):
-                        continue
+                # Filter by cabin class (exact match on product_type "COACH")
+                if cabin_filter == "COACH" and product_type != "COACH":
+                    continue
+                elif cabin_filter != "COACH" and not product_type.startswith(cabin_filter):
+                    continue
                 
                 # Extract pricing information from slicePricing
                 slice_pricing = pricing_option.get("slicePricing", {})
@@ -392,10 +413,8 @@ class FlightDataParser:
                 # For Award: points_or_fare is points, for Revenue: it's base fare
                 if search_type == "Award":
                     points = int(points_or_fare)
-                    fare_amount = 0.0
                 else:
                     points = 0
-                    fare_amount = points_or_fare
                 
                 # Taxes and fees
                 taxes_fees = slice_pricing.get("allPassengerDisplayTaxTotal", {}).get("amount", 0.0)
@@ -409,24 +428,18 @@ class FlightDataParser:
                 else:
                     cpp = 0.0
                 
-                # Create flight segment
-                segments = [FlightSegment(
-                    flight_number=f"{origin}-{destination}",
-                    departure_time=dep_time,
-                    arrival_time=arr_time
-                )]
-                
-                flight = FlightOption(
-                    is_nonstop=is_nonstop,
-                    segments=[asdict(seg) for seg in segments],
-                    total_duration=duration_str,
-                    points_required=points,
-                    cash_price_usd=cash_total,
-                    taxes_fees_usd=taxes_fees,
-                    cpp=cpp,
-                    cabin_class=product_group,
-                    product_type=product_type
-                )
+                # Build flight dict (without cabin_class and product_type)
+                flight = {
+                    "is_nonstop": is_nonstop,
+                    "segments": parsed_segments,
+                    "total_duration": duration_str,
+                    "points_required": points,
+                    "cash_price_usd": cash_total,
+                    "taxes_fees_usd": taxes_fees,
+                    "cpp": cpp,
+                    # Store product_type temporarily for merging logic
+                    "_product_type": product_type
+                }
                 
                 flights.append(flight)
         
@@ -447,13 +460,13 @@ async def scrape_flights(
     cabin_filter: str = "COACH",
     search_types: List[str] = ["Award", "Revenue"],
     rate_limit: float = 1.0
-) -> tuple[Dict[str, Optional[FlightSearchResult]], Dict[str, Optional[Dict[str, Any]]]]:
+) -> tuple[Dict[str, Optional[List[Dict[str, Any]]]], Dict[str, Optional[Dict[str, Any]]]]:
     """
     Main scraping function - scrapes both Award and Revenue searches
     
     Returns:
         Tuple of:
-        - Dictionary with keys "Award" and "Revenue" containing parsed results
+        - Dictionary with keys "Award" and "Revenue" containing parsed flight lists
         - Dictionary with keys "Award" and "Revenue" containing raw API responses
     """
     rate_limiter = RateLimiter(rate=rate_limit, burst=int(rate_limit * 2))
@@ -487,22 +500,7 @@ async def scrape_flights(
             results[search_type] = None
             continue
         
-        # Build result
-        metadata = SearchMetadata(
-            origin=origin,
-            destination=destination,
-            date=date,
-            passengers=passengers,
-            search_type=search_type
-        )
-        
-        result = FlightSearchResult(
-            search_metadata=asdict(metadata),
-            flights=[asdict(f) for f in flights],
-            total_results=len(flights)
-        )
-        
-        results[search_type] = result
+        results[search_type] = flights
     
     return results, raw_responses
 
@@ -513,12 +511,13 @@ async def scrape_flights(
 
 
 def save_results(
-    results: Dict[str, Optional[FlightSearchResult]],
+    results: Dict[str, Optional[List[Dict[str, Any]]]],
     raw_responses: Dict[str, Optional[Dict[str, Any]]],
     output_dir: Path,
     origin: str,
     destination: str,
-    date: str
+    date: str,
+    cabin_filter: str
 ):
     """Save scraping results with Award and Revenue data properly merged, plus raw responses"""
     ensure_directory(output_dir)
@@ -543,26 +542,30 @@ def save_results(
             logger.info(f"✓ Saved raw {search_type} response: {raw_file}")
     
     # ========================================================================
-    # Process and save merged results (existing logic)
+    # Process and save merged results
     # ========================================================================
     
-    # Convert FlightSearchResult objects to dictionaries
-    award_result = asdict(results["Award"]) if results.get("Award") else None
-    revenue_result = asdict(results["Revenue"]) if results.get("Revenue") else None
+    award_flights = results.get("Award")
+    revenue_flights = results.get("Revenue")
     
     # Create a merged flight list
     merged_flights = []
     
-    if award_result and revenue_result:
+    if award_flights and revenue_flights:
         # Create a lookup dict for revenue flights - ONLY exact "COACH" product type
         revenue_lookup = {}
-        for flight in revenue_result["flights"]:
+        for flight in revenue_flights:
             # Filter: Only include exact "COACH" product type
-            if flight["product_type"] != "COACH":
+            if flight.get("_product_type") != "COACH":
                 continue
                 
-            dep_time = flight["segments"][0]["departure_time"]
-            arr_time = flight["segments"][0]["arrival_time"]
+            # Create key based on segments
+            segments = flight["segments"]
+            if not segments:
+                continue
+            
+            dep_time = segments[0]["departure_time"]
+            arr_time = segments[-1]["arrival_time"]
             nonstop = flight["is_nonstop"]
             key = (dep_time, arr_time, nonstop)
             
@@ -570,13 +573,17 @@ def save_results(
                 revenue_lookup[key] = flight
         
         # Merge Award flights with Revenue data - ONLY exact "COACH"
-        for award_flight in award_result["flights"]:
+        for award_flight in award_flights:
             # Filter: Only include exact "COACH" product type
-            if award_flight["product_type"] != "COACH":
+            if award_flight.get("_product_type") != "COACH":
                 continue
             
-            dep_time = award_flight["segments"][0]["departure_time"]
-            arr_time = award_flight["segments"][0]["arrival_time"]
+            segments = award_flight["segments"]
+            if not segments:
+                continue
+            
+            dep_time = segments[0]["departure_time"]
+            arr_time = segments[-1]["arrival_time"]
             nonstop = award_flight["is_nonstop"]
             key = (dep_time, arr_time, nonstop)
             
@@ -597,14 +604,24 @@ def save_results(
             else:
                 merged_flight = award_flight.copy()
             
+            # Remove temporary product_type field
+            merged_flight.pop("_product_type", None)
             merged_flights.append(merged_flight)
     
-    elif award_result:
+    elif award_flights:
         # Filter for exact "COACH" only
-        merged_flights = [f for f in award_result["flights"] if f["product_type"] == "COACH"]
-    elif revenue_result:
+        merged_flights = [
+            {k: v for k, v in f.items() if k != "_product_type"}
+            for f in award_flights 
+            if f.get("_product_type") == "COACH"
+        ]
+    elif revenue_flights:
         # Filter for exact "COACH" only
-        merged_flights = [f for f in revenue_result["flights"] if f["product_type"] == "COACH"]
+        merged_flights = [
+            {k: v for k, v in f.items() if k != "_product_type"}
+            for f in revenue_flights 
+            if f.get("_product_type") == "COACH"
+        ]
     
     # Build the final merged result
     merged_result = {
@@ -613,13 +630,13 @@ def save_results(
             "destination": destination.upper(),
             "date": date,
             "passengers": 1,
-            "search_types": [k for k, v in results.items() if v is not None]
+            "cabin_class": CABIN_CLASS_MAP.get(cabin_filter, cabin_filter.lower())
         },
         "flights": merged_flights,
         "total_results": len(merged_flights)
     }
     
-    # Save ONLY the single merged file
+    # Save the merged file
     output_file = output_dir / f"{base_filename}_combined.json"
     output_file.write_text(
         json.dumps(merged_result, ensure_ascii=False, indent=2),
@@ -691,15 +708,24 @@ def main():
             logger.error("❌ All searches failed")
             sys.exit(1)
         
-        save_results(results, raw_responses, output_dir, args.origin, args.destination, args.date)
+        save_results(
+            results, 
+            raw_responses, 
+            output_dir, 
+            args.origin, 
+            args.destination, 
+            args.date,
+            args.cabin
+        )
         
         logger.info(f"\n{'='*60}")
         logger.info(f"✓ Scraping complete!")
         logger.info(f"  Route: {args.origin} → {args.destination}")
         logger.info(f"  Date: {args.date}")
+        logger.info(f"  Cabin: {CABIN_CLASS_MAP.get(args.cabin, args.cabin.lower())}")
         for search_type, result in results.items():
             if result:
-                logger.info(f"  {search_type}: {result.total_results} flights found")
+                logger.info(f"  {search_type}: {len(result)} flights found")
         logger.info(f"  Output: {output_dir}")
         logger.info(f"  Raw data: {output_dir / 'raw_data'}")
         logger.info(f"{'='*60}\n")
