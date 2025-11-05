@@ -302,48 +302,189 @@ class CookieManager:
             logger.error(f"Failed to load cookies from file: {e}")
     
     async def _extract_fresh_cookies(self, headless: bool, wait_time: int):
-        """Extract fresh cookies using Camoufox - FIXED VERSION"""
+        """
+        Extract cookies by waiting for SUCCESSFUL, VALIDATED API response.
+        
+        Key improvements:
+        - Strict validation that API response contains actual flight data
+        - Don't save cookies unless response is confirmed valid
+        - Re-validate before saving to prevent saving "almost ready" cookies
+        """
         from camoufox.async_api import AsyncCamoufox
+        import urllib.parse
         
         logger.info(f"🦊 Extracting cookies: {self.test_origin} → {self.test_destination}")
         
-        departure_date = (datetime.now() + timedelta(days=self.test_days_ahead)).strftime("%m/%d/%Y")
+        # Build departure date
+        departure_date = (datetime.now() + timedelta(days=self.test_days_ahead)).strftime("%Y-%m-%d")
+        
+        # Build direct search URL
+        slices_data = [{
+            "orig": self.test_origin,
+            "origNearby": False,
+            "dest": self.test_destination,
+            "destNearby": False,
+            "date": departure_date
+        }]
+        
+        slices_json = json.dumps(slices_data, separators=(',', ':'))
+        
+        search_url = (
+            f"{BASE_URL}/booking/search?"
+            f"locale=en_US&"
+            f"fareType=Lowest&"
+            f"pax=1&"
+            f"adult=1&"
+            f"type=OneWay&"
+            f"searchType=Revenue&"
+            f"cabin=&"
+            f"carriers=ALL&"
+            f"travelType=personal&"
+            f"slices={urllib.parse.quote(slices_json)}"
+        )
         
         captured_headers = {}
         captured_referer = ""
         captured_cookies = {}
+        api_response_data = None
+        api_request_completed = False
         
         try:
             async with AsyncCamoufox(headless=headless) as browser:
                 page = await browser.new_page()
                 
-                # Request interception for headers
-                api_request_captured = False
-                
-                async def handle_request(route):
-                    request = route.request
-                    nonlocal api_request_captured, captured_headers
+                # ================================================================
+                # RESPONSE INTERCEPTION - Wait for VALID API response
+                # ================================================================
+                async def handle_response(response):
+                    nonlocal api_response_data, api_request_completed, captured_headers
                     
-                    if "/booking/api/search/itinerary" in request.url:
-                        if not api_request_captured:
-                            logger.debug("🎯 Intercepted API call, capturing headers")
-                            raw_headers = dict(request.headers)
-                            captured_headers = self._clean_headers(raw_headers)
-                            api_request_captured = True
-                            logger.debug(f"   Captured {len(captured_headers)} headers")
+                    if "/booking/api/search/itinerary" in response.url:
+                        try:
+                            status = response.status
+                            logger.debug(f"🎯 API response intercepted: HTTP {status}")
+                            
+                            if status == 200:
+                                # Try to parse JSON
+                                try:
+                                    data = await response.json()
+                                    
+                                    # ============================================
+                                    # STRICT VALIDATION - Verify real flight data
+                                    # ============================================
+                                    if "slices" not in data:
+                                        logger.warning(f"⚠️ API response missing 'slices' field")
+                                        return
+                                    
+                                    slices = data.get("slices", [])
+                                    if len(slices) == 0:
+                                        logger.warning(f"⚠️ API response has empty slices array")
+                                        return
+                                    
+                                    # Check that at least one slice has pricing data
+                                    has_valid_pricing = False
+                                    for slice_data in slices:
+                                        pricing = slice_data.get("pricingDetail", [])
+                                        if pricing and len(pricing) > 0:
+                                            # Verify pricing has actual data
+                                            for price_option in pricing:
+                                                if price_option.get("productAvailable", False):
+                                                    has_valid_pricing = True
+                                                    break
+                                        if has_valid_pricing:
+                                            break
+                                    
+                                    if not has_valid_pricing:
+                                        logger.warning(f"⚠️ API response has no valid pricing data")
+                                        return
+                                    
+                                    # ============================================
+                                    # SUCCESS - This is a valid response!
+                                    # ============================================
+                                    api_response_data = data
+                                    api_request_completed = True
+                                    
+                                    # Capture request headers
+                                    request = response.request
+                                    raw_headers = dict(request.headers)
+                                    captured_headers = self._clean_headers(raw_headers)
+                                    
+                                    logger.success(f"✅ Valid API response received!")
+                                    logger.debug(f"   Slices: {len(slices)}")
+                                    logger.debug(f"   Has pricing: {has_valid_pricing}")
+                                    logger.debug(f"   Headers captured: {len(captured_headers)}")
+                                    
+                                except json.JSONDecodeError as e:
+                                    logger.warning(f"⚠️ API response not valid JSON: {e}")
+                            else:
+                                logger.warning(f"⚠️ API returned non-200 status: {status}")
+                                
+                        except Exception as e:
+                            logger.warning(f"⚠️ Error processing API response: {e}")
+                
+                page.on("response", handle_response)
+                
+                # ================================================================
+                # STEP 1: Navigate to search URL
+                # ================================================================
+                logger.info("Step 1/4: Navigating to search URL...")
+                logger.debug(f"   URL: {search_url[:100]}...")
+                
+                start_time = datetime.now()
+                
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+                
+                # Quick initial wait
+                await page.wait_for_timeout(2000)
+                
+                # ================================================================
+                # STEP 2: Detect and handle Akamai challenge
+                # ================================================================
+                current_url = page.url
+                page_content = await page.content()
+                
+                is_akamai, challenge_type = self._detect_akamai_challenge(current_url, page_content)
+                
+                if is_akamai:
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    logger.warning(f"🛡️ Akamai challenge detected! ({challenge_type})")
+                    logger.info(f"   Already waited: {elapsed:.1f}s")
+                    logger.info(f"   Waiting for challenge to complete...")
                     
-                    await route.continue_()
+                    # Wait for challenge to solve and API call to complete
+                    try:
+                        await page.wait_for_function(
+                            """
+                            () => {
+                                const url = window.location.href;
+                                const content = document.body.innerHTML;
+                                return !url.includes('akamai') && 
+                                    !url.includes('challenge') &&
+                                    !content.includes('sec_chlge_form') &&
+                                    (url.includes('choose-flights') || 
+                                        url.includes('find-flights') || 
+                                        url.includes('booking'));
+                            }
+                            """,
+                            timeout=90000
+                        )
+                        
+                        total_elapsed = (datetime.now() - start_time).total_seconds()
+                        logger.success(f"✓ Akamai challenge passed! ({total_elapsed:.1f}s)")
+                        
+                    except Exception as e:
+                        logger.error(f"❌ Akamai challenge timeout: {e}")
+                        await page.screenshot(path="error_akamai_timeout.png")
+                        raise CookieExpiredError("Akamai challenge failed")
+                else:
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    logger.success(f"✓ No Akamai challenge ({elapsed:.1f}s)")
                 
-                await page.route("**/*", handle_request)
-                
-                # Step 1: Navigate to homepage
-                logger.info("Step 1/4: Loading homepage...")
-                await page.goto(f"{BASE_URL}/?locale=en_US", wait_until="networkidle")
-                await page.wait_for_timeout(3000)
-                
-                # Handle cookie consent - THIS WAS IN THE ORIGINAL
+                # Handle cookie consent
                 try:
-                    accept_btn = await page.query_selector('#onetrust-accept-btn-handler, #accept-recommended-btn-handler')
+                    accept_btn = await page.query_selector(
+                        '#onetrust-accept-btn-handler, #accept-recommended-btn-handler'
+                    )
                     if accept_btn:
                         await accept_btn.click()
                         logger.debug("✓ Accepted cookie consent")
@@ -351,129 +492,112 @@ class CookieManager:
                 except:
                     pass
                 
-                # Step 2: Fill search form - RESTORE ORIGINAL APPROACH
-                logger.info("Step 2/4: Filling search form...")
+                # ================================================================
+                # STEP 3: Wait for API request to complete with VALID response
+                # ================================================================
+                logger.info("Step 3/4: Waiting for VALID API response...")
                 
-                try:
-                    await page.wait_for_selector('input[name="originAirport"]', timeout=10000, state="visible")
-                    await page.wait_for_timeout(2000)
-                    
-                    # Verify one-way is selected
-                    one_way_checked = await page.is_checked('input[id="flightSearchForm.tripType.oneWay"]')
-                    if not one_way_checked:
-                        await page.click('label[for="flightSearchForm.tripType.oneWay"]')
-                        await page.wait_for_timeout(500)
-                    logger.debug("✓ One-way trip selected")
-                    
-                    # Fill origin
-                    origin_input = await page.query_selector('input[name="originAirport"]')
-                    await origin_input.click()
-                    await page.wait_for_timeout(500)
-                    
-                    await page.evaluate(f'''
-                        const originInput = document.querySelector('input[name="originAirport"]');
-                        originInput.value = "{self.test_origin}";
-                        originInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        originInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    ''')
-                    await page.wait_for_timeout(1000)
-                    
-                    # Fill destination
-                    dest_input = await page.query_selector('input[name="destinationAirport"]')
-                    await dest_input.click()
-                    await page.wait_for_timeout(500)
-                    
-                    await page.evaluate(f'''
-                        const destInput = document.querySelector('input[name="destinationAirport"]');
-                        destInput.value = "{self.test_destination}";
-                        destInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        destInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    ''')
-                    await page.wait_for_timeout(1000)
-                    
-                    # Fill date
-                    date_input = await page.query_selector('input[name="departDate"]')
-                    await date_input.click()
-                    await page.wait_for_timeout(500)
-                    
-                    await page.evaluate(f'''
-                        const dateInput = document.querySelector('input[name="departDate"]');
-                        dateInput.value = "{departure_date}";
-                        dateInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        dateInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    ''')
-                    await page.wait_for_timeout(1000)
-                    
-                    logger.debug(f"✓ Form filled: {self.test_origin} → {self.test_destination} on {departure_date}")
-                    
-                except Exception as e:
-                    logger.error(f"❌ Failed to fill form: {e}")
-                    await page.screenshot(path="error_form_fill.png")
-                    raise
+                # Wait for API call with timeout
+                max_wait = wait_time
+                elapsed = 0
+                check_interval = 1  # Check every second
                 
-                # Step 3: Submit search
-                logger.info("Step 3/4: Submitting search...")
-                try:
-                    submit_btn = await page.query_selector('input[type="submit"][id="flightSearchForm.button.reSubmit"]')
-                    if not submit_btn:
-                        raise Exception("Submit button not found")
+                while elapsed < max_wait and not api_request_completed:
+                    await page.wait_for_timeout(check_interval * 1000)
+                    elapsed += check_interval
                     
-                    try:
-                        async with page.expect_navigation(wait_until="networkidle", timeout=60000):
-                            await submit_btn.click()
-                            logger.debug("✓ Search button clicked, waiting for navigation...")
-                    except Exception as nav_error:
-                        logger.warning(f"⚠️ Navigation wait failed: {nav_error}")
+                    if elapsed % 5 == 0:  # Log every 5 seconds
+                        logger.debug(f"   Waiting for valid API response... ({elapsed}/{max_wait}s)")
+                
+                if not api_request_completed:
+                    logger.warning(f"⚠️ Valid API response not received after {max_wait}s")
                     
+                    # Try scrolling to trigger any lazy-loaded content
+                    logger.info("   Attempting scroll to trigger API...")
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await page.wait_for_timeout(5000)
                     
-                    current_url = page.url
-                    captured_referer = current_url
-                    logger.debug(f"📍 Current URL: {current_url}")
-                    
-                    if any(pattern in current_url for pattern in ["/choose-flights", "/flights", "/booking/find-flights"]):
-                        logger.debug("✅ Reached flight results page!")
-                    elif "homePage" in current_url:
-                        logger.error("❌ Form submission failed - still on homepage")
-                        raise Exception("Form submission failed")
-                    else:
-                        logger.warning(f"⚠️ Unexpected URL: {current_url}")
-                    
-                except Exception as e:
-                    logger.error(f"❌ Failed to submit search: {e}")
-                    await page.screenshot(path="error_submit.png")
-                    raise
+                    if not api_request_completed:
+                        logger.error("❌ Still no valid API response")
+                        await page.screenshot(path="error_no_valid_api.png")
+                        
+                        # Check if we're stuck on error page
+                        final_url = page.url
+                        final_content = await page.content()
+                        
+                        if "error" in final_content.lower() or "sorry" in final_content.lower():
+                            raise CookieExpiredError("Stuck on error page - no valid API response")
+                        
+                        # More detailed error
+                        raise CookieExpiredError(
+                            f"Valid API response not received after {max_wait}s. "
+                            "Cookies may be incomplete or invalid."
+                        )
+                else:
+                    wait_elapsed = (datetime.now() - start_time).total_seconds()
+                    logger.success(f"✅ Valid API response confirmed! ({wait_elapsed:.1f}s)")
                 
-                # Step 4: Wait for results and API calls
-                logger.info(f"Step 4/4: Waiting {wait_time}s for API calls...")
-                await page.wait_for_timeout(wait_time * 1000)
+                # ================================================================
+                # STEP 4: Extract cookies ONLY AFTER valid API response
+                # ================================================================
+                logger.info("Step 4/4: Extracting validated cookies...")
                 
-                # Check if API call was intercepted
-                if not api_request_captured:
-                    logger.warning("⚠️ Did not intercept API call - trying to trigger it...")
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(3000)
+                # Get final URL for referer
+                final_url = page.url
+                captured_referer = final_url
+                logger.debug(f"📍 Final URL: {final_url}")
                 
-                # Extract cookies
+                # Extract cookies NOW (after validated API response)
                 raw_cookies = await page.context.cookies()
                 for cookie in raw_cookies:
                     captured_cookies[cookie['name']] = cookie['value']
                 
                 logger.debug(f"✓ Extracted {len(captured_cookies)} cookies")
                 
-                # Validate critical cookies
-                critical_cookies = ['XSRF-TOKEN', 'spa_session_id', 'JSESSIONID']
-                found_critical = [c for c in critical_cookies if c in captured_cookies]
+                # Validate cookies
+                self._validate_extracted_cookies(captured_cookies)
                 
-                if found_critical:
-                    logger.debug(f"  ✓ Found critical cookies: {', '.join(found_critical)}")
-                
-                bot_cookies = ['_abck', 'bm_sz', 'ak_bmsc', 'bm_sv']
-                found_bot = [c for c in bot_cookies if c in captured_cookies]
-                if found_bot:
-                    logger.debug(f"  ✓ Found bot-defense cookies: {', '.join(found_bot)}")
+                # Validate we got headers
+                if not captured_headers:
+                    logger.warning("⚠️ No headers captured - using fallback")
             
-            # Success - update state
+            # ====================================================================
+            # FINAL VALIDATION - Only save if everything is valid
+            # ====================================================================
+            logger.info("Performing final validation before saving...")
+            
+            # Check API response
+            if not api_request_completed:
+                raise CookieExpiredError("API request did not complete successfully")
+            
+            if not api_response_data:
+                raise CookieExpiredError("No API response data captured")
+            
+            # Re-validate API response structure
+            slices = api_response_data.get("slices", [])
+            if not slices or len(slices) == 0:
+                raise CookieExpiredError("Invalid API response - no flight slices")
+            
+            # Verify at least one slice has valid pricing
+            has_valid_pricing = any(
+                slice_data.get("pricingDetail") and 
+                len(slice_data.get("pricingDetail", [])) > 0 and
+                any(p.get("productAvailable", False) for p in slice_data.get("pricingDetail", []))
+                for slice_data in slices
+            )
+            
+            if not has_valid_pricing:
+                raise CookieExpiredError("Invalid API response - no valid pricing data")
+            
+            logger.success(f"✓ Final validation passed: {len(slices)} slices with pricing")
+            
+            # Check cookies
+            if not captured_cookies:
+                raise CookieExpiredError("No cookies were captured")
+            
+            # ====================================================================
+            # SUCCESS - Save everything
+            # ====================================================================
             self.cookies = captured_cookies
             self.headers = captured_headers
             self.referer = captured_referer
@@ -481,11 +605,90 @@ class CookieManager:
             
             self._save_to_file()
             
-            logger.success(f"✓ Cookie extraction successful: {len(captured_cookies)} cookies, {len(captured_headers)} headers")
+            total_time = (datetime.now() - start_time).total_seconds()
+            
+            # Log summary
+            logger.success(f"🎉 Cookie extraction complete in {total_time:.1f}s:")
+            logger.info(f"   • Cookies: {len(captured_cookies)}")
+            logger.info(f"   • Headers: {len(captured_headers)}")
+            logger.info(f"   • API validated: ✓")
+            logger.info(f"   • Slices: {len(slices)}")
+            logger.info(f"   • Has pricing: ✓")
+            
+            return api_response_data
             
         except Exception as e:
             logger.error(f"Cookie extraction failed: {e}")
             raise CookieExpiredError(f"Failed to extract cookies: {e}")
+
+    def _detect_akamai_challenge(self, url: str, page_content: str) -> Tuple[bool, str]:
+        """
+        Detect if page is showing Akamai bot challenge.
+        
+        Returns:
+            (is_challenge, challenge_type)
+        """
+        # Check URL for Akamai paths
+        akamai_url_patterns = {
+            'akamai_path': '/ZetFNOmfUz0qb36s_',
+            'akamai_path2': '/booking/api/akamai',
+            'challenge_resubmit': 'akamai-challenge-resubmit',
+        }
+        
+        url_lower = url.lower()
+        for challenge_type, pattern in akamai_url_patterns.items():
+            if pattern.lower() in url_lower:
+                return True, challenge_type
+        
+        # Check page content for challenge markers
+        akamai_content_markers = {
+            'challenge_iframe': 'title="Challenge Content"',
+            'challenge_form': 'sec_chlge_form',
+            'challenge_script': 'cp_clge_done',
+            'crypto_provider': 'provider="crypto"',
+            'sec_container': 'class="sec-container"',
+        }
+        
+        for challenge_type, marker in akamai_content_markers.items():
+            if marker in page_content:
+                return True, challenge_type
+        
+        return False, "none"
+
+    def _validate_extracted_cookies(self, cookies: Dict[str, str]):
+        """Validate that we captured essential cookies"""
+        # Critical cookies (must have)
+        critical_cookies = ['XSRF-TOKEN', 'spa_session_id']
+        
+        # Important cookies (should have)
+        important_cookies = ['JSESSIONID', '_abck', 'bm_sv']
+        
+        # Bot defense cookies (good to have)
+        bot_cookies = ['bm_sz', 'ak_bmsc', 'bm_s', 'sec_cpt']
+        
+        # Check critical
+        found_critical = [c for c in critical_cookies if c in cookies]
+        missing_critical = [c for c in critical_cookies if c not in cookies]
+        
+        if found_critical:
+            logger.debug(f"  ✓ Critical: {', '.join(found_critical)}")
+        if missing_critical:
+            logger.error(f"  ❌ Missing critical: {', '.join(missing_critical)}")
+            raise CookieExpiredError(f"Missing critical cookies: {missing_critical}")
+        
+        # Check important
+        found_important = [c for c in important_cookies if c in cookies]
+        if found_important:
+            logger.debug(f"  ✓ Important: {', '.join(found_important)}")
+        else:
+            logger.warning("  ⚠️ No important cookies (may cause issues)")
+        
+        # Check bot defense
+        found_bot = [c for c in bot_cookies if c in cookies]
+        if found_bot:
+            logger.debug(f"  ✓ Bot-defense: {', '.join(found_bot)}")
+        else:
+            logger.warning("  ⚠️ No bot-defense cookies")
         
     def _clean_headers(self, raw_headers: Dict[str, str]) -> Dict[str, str]:
         """Clean headers for httpx use"""
