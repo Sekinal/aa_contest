@@ -303,12 +303,9 @@ class CookieManager:
     
     async def _extract_fresh_cookies(self, headless: bool, wait_time: int):
         """
-        Extract cookies by waiting for SUCCESSFUL, VALIDATED API response.
-        
-        Key improvements:
-        - Strict validation that API response contains actual flight data
-        - Don't save cookies unless response is confirmed valid
-        - Re-validate before saving to prevent saving "almost ready" cookies
+        Extract cookies by:
+        1. Going to homepage and accepting cookies
+        2. Then navigating to search page with validated session
         """
         from camoufox.async_api import AsyncCamoufox
         import urllib.parse
@@ -353,8 +350,33 @@ class CookieManager:
             async with AsyncCamoufox(headless=headless) as browser:
                 page = await browser.new_page()
                 
+                start_time = datetime.now()
+                
                 # ================================================================
-                # RESPONSE INTERCEPTION - Wait for VALID API response
+                # STEP 1: Go to HOMEPAGE and accept cookies FIRST
+                # ================================================================
+                logger.info("Step 1/5: Loading homepage and accepting cookies...")
+                
+                await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
+                
+                # Wait for page to load
+                await page.wait_for_timeout(2000)
+                
+                # Accept cookies on homepage
+                cookie_accepted = await self._accept_cookie_consent(page)
+                
+                if cookie_accepted:
+                    logger.success("   ✅ Cookie consent accepted on homepage!")
+                    # Give it a moment to save the consent
+                    await page.wait_for_timeout(1000)
+                else:
+                    logger.warning("   ⚠️ Cookie banner not found (may already be accepted)")
+                
+                elapsed = (datetime.now() - start_time).total_seconds()
+                logger.info(f"   Homepage loaded and consent accepted in {elapsed:.1f}s")
+                
+                # ================================================================
+                # RESPONSE INTERCEPTION - Set up before navigating to search
                 # ================================================================
                 async def handle_response(response):
                     nonlocal api_response_data, api_request_completed, captured_headers
@@ -365,13 +387,10 @@ class CookieManager:
                             logger.debug(f"🎯 API response intercepted: HTTP {status}")
                             
                             if status == 200:
-                                # Try to parse JSON
                                 try:
                                     data = await response.json()
                                     
-                                    # ============================================
-                                    # STRICT VALIDATION - Verify real flight data
-                                    # ============================================
+                                    # Validate response has flight data
                                     if "slices" not in data:
                                         logger.warning(f"⚠️ API response missing 'slices' field")
                                         return
@@ -381,12 +400,11 @@ class CookieManager:
                                         logger.warning(f"⚠️ API response has empty slices array")
                                         return
                                     
-                                    # Check that at least one slice has pricing data
+                                    # Check for valid pricing
                                     has_valid_pricing = False
                                     for slice_data in slices:
                                         pricing = slice_data.get("pricingDetail", [])
                                         if pricing and len(pricing) > 0:
-                                            # Verify pricing has actual data
                                             for price_option in pricing:
                                                 if price_option.get("productAvailable", False):
                                                     has_valid_pricing = True
@@ -398,9 +416,7 @@ class CookieManager:
                                         logger.warning(f"⚠️ API response has no valid pricing data")
                                         return
                                     
-                                    # ============================================
-                                    # SUCCESS - This is a valid response!
-                                    # ============================================
+                                    # SUCCESS!
                                     api_response_data = data
                                     api_request_completed = True
                                     
@@ -412,7 +428,6 @@ class CookieManager:
                                     logger.success(f"✅ Valid API response received!")
                                     logger.debug(f"   Slices: {len(slices)}")
                                     logger.debug(f"   Has pricing: {has_valid_pricing}")
-                                    logger.debug(f"   Headers captured: {len(captured_headers)}")
                                     
                                 except json.JSONDecodeError as e:
                                     logger.warning(f"⚠️ API response not valid JSON: {e}")
@@ -425,20 +440,20 @@ class CookieManager:
                 page.on("response", handle_response)
                 
                 # ================================================================
-                # STEP 1: Navigate to search URL
+                # STEP 2: NOW navigate to search URL with validated session
                 # ================================================================
-                logger.info("Step 1/4: Navigating to search URL...")
-                logger.debug(f"   URL: {search_url[:100]}...")
-                
-                start_time = datetime.now()
+                logger.info("Step 2/5: Navigating to search page with validated cookies...")
                 
                 await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
                 
-                # Quick initial wait
+                # Brief wait for page to load
                 await page.wait_for_timeout(2000)
                 
+                elapsed = (datetime.now() - start_time).total_seconds()
+                logger.info(f"   Search page loaded in {elapsed:.1f}s")
+                
                 # ================================================================
-                # STEP 2: Detect and handle Akamai challenge
+                # STEP 3: Detect and handle Akamai challenge
                 # ================================================================
                 current_url = page.url
                 page_content = await page.content()
@@ -448,10 +463,8 @@ class CookieManager:
                 if is_akamai:
                     elapsed = (datetime.now() - start_time).total_seconds()
                     logger.warning(f"🛡️ Akamai challenge detected! ({challenge_type})")
-                    logger.info(f"   Already waited: {elapsed:.1f}s")
                     logger.info(f"   Waiting for challenge to complete...")
                     
-                    # Wait for challenge to solve and API call to complete
                     try:
                         await page.wait_for_function(
                             """
@@ -480,39 +493,26 @@ class CookieManager:
                     elapsed = (datetime.now() - start_time).total_seconds()
                     logger.success(f"✓ No Akamai challenge ({elapsed:.1f}s)")
                 
-                # Handle cookie consent
-                try:
-                    accept_btn = await page.query_selector(
-                        '#onetrust-accept-btn-handler, #accept-recommended-btn-handler'
-                    )
-                    if accept_btn:
-                        await accept_btn.click()
-                        logger.debug("✓ Accepted cookie consent")
-                        await page.wait_for_timeout(1000)
-                except:
-                    pass
-                
                 # ================================================================
-                # STEP 3: Wait for API request to complete with VALID response
+                # STEP 4: Wait for API request with valid response
                 # ================================================================
-                logger.info("Step 3/4: Waiting for VALID API response...")
+                logger.info("Step 4/5: Waiting for VALID API response...")
                 
-                # Wait for API call with timeout
                 max_wait = wait_time
                 elapsed = 0
-                check_interval = 1  # Check every second
+                check_interval = 1
                 
                 while elapsed < max_wait and not api_request_completed:
                     await page.wait_for_timeout(check_interval * 1000)
                     elapsed += check_interval
                     
-                    if elapsed % 5 == 0:  # Log every 5 seconds
-                        logger.debug(f"   Waiting for valid API response... ({elapsed}/{max_wait}s)")
+                    if elapsed % 5 == 0:
+                        logger.debug(f"   Waiting... ({elapsed}/{max_wait}s)")
                 
                 if not api_request_completed:
                     logger.warning(f"⚠️ Valid API response not received after {max_wait}s")
                     
-                    # Try scrolling to trigger any lazy-loaded content
+                    # Try scrolling
                     logger.info("   Attempting scroll to trigger API...")
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await page.wait_for_timeout(5000)
@@ -520,34 +520,16 @@ class CookieManager:
                     if not api_request_completed:
                         logger.error("❌ Still no valid API response")
                         await page.screenshot(path="error_no_valid_api.png")
-                        
-                        # Check if we're stuck on error page
-                        final_url = page.url
-                        final_content = await page.content()
-                        
-                        if "error" in final_content.lower() or "sorry" in final_content.lower():
-                            raise CookieExpiredError("Stuck on error page - no valid API response")
-                        
-                        # More detailed error
-                        raise CookieExpiredError(
-                            f"Valid API response not received after {max_wait}s. "
-                            "Cookies may be incomplete or invalid."
-                        )
-                else:
-                    wait_elapsed = (datetime.now() - start_time).total_seconds()
-                    logger.success(f"✅ Valid API response confirmed! ({wait_elapsed:.1f}s)")
+                        raise CookieExpiredError("Valid API response not received")
                 
                 # ================================================================
-                # STEP 4: Extract cookies ONLY AFTER valid API response
+                # STEP 5: Extract cookies
                 # ================================================================
-                logger.info("Step 4/4: Extracting validated cookies...")
+                logger.info("Step 5/5: Extracting validated cookies...")
                 
-                # Get final URL for referer
                 final_url = page.url
                 captured_referer = final_url
-                logger.debug(f"📍 Final URL: {final_url}")
                 
-                # Extract cookies NOW (after validated API response)
                 raw_cookies = await page.context.cookies()
                 for cookie in raw_cookies:
                     captured_cookies[cookie['name']] = cookie['value']
@@ -556,44 +538,16 @@ class CookieManager:
                 
                 # Validate cookies
                 self._validate_extracted_cookies(captured_cookies)
-                
-                # Validate we got headers
-                if not captured_headers:
-                    logger.warning("⚠️ No headers captured - using fallback")
             
             # ====================================================================
-            # FINAL VALIDATION - Only save if everything is valid
+            # FINAL VALIDATION
             # ====================================================================
-            logger.info("Performing final validation before saving...")
-            
-            # Check API response
-            if not api_request_completed:
+            if not api_request_completed or not api_response_data:
                 raise CookieExpiredError("API request did not complete successfully")
             
-            if not api_response_data:
-                raise CookieExpiredError("No API response data captured")
-            
-            # Re-validate API response structure
             slices = api_response_data.get("slices", [])
-            if not slices or len(slices) == 0:
+            if not slices:
                 raise CookieExpiredError("Invalid API response - no flight slices")
-            
-            # Verify at least one slice has valid pricing
-            has_valid_pricing = any(
-                slice_data.get("pricingDetail") and 
-                len(slice_data.get("pricingDetail", [])) > 0 and
-                any(p.get("productAvailable", False) for p in slice_data.get("pricingDetail", []))
-                for slice_data in slices
-            )
-            
-            if not has_valid_pricing:
-                raise CookieExpiredError("Invalid API response - no valid pricing data")
-            
-            logger.success(f"✓ Final validation passed: {len(slices)} slices with pricing")
-            
-            # Check cookies
-            if not captured_cookies:
-                raise CookieExpiredError("No cookies were captured")
             
             # ====================================================================
             # SUCCESS - Save everything
@@ -607,19 +561,56 @@ class CookieManager:
             
             total_time = (datetime.now() - start_time).total_seconds()
             
-            # Log summary
             logger.success(f"🎉 Cookie extraction complete in {total_time:.1f}s:")
             logger.info(f"   • Cookies: {len(captured_cookies)}")
             logger.info(f"   • Headers: {len(captured_headers)}")
             logger.info(f"   • API validated: ✓")
             logger.info(f"   • Slices: {len(slices)}")
-            logger.info(f"   • Has pricing: ✓")
             
             return api_response_data
             
         except Exception as e:
             logger.error(f"Cookie extraction failed: {e}")
             raise CookieExpiredError(f"Failed to extract cookies: {e}")
+
+    async def _accept_cookie_consent(self, page) -> bool:
+        """
+        Accept cookie consent banner - simple and fast version.
+        Returns True if banner was found and accepted.
+        """
+        selectors = [
+            '#accept-recommended-btn-handler',
+            '#onetrust-accept-btn-handler',
+            'button:has-text("Accept")',
+            'button:has-text("Accept all")',
+            'button:has-text("Aceptar")',
+        ]
+        
+        for selector in selectors:
+            try:
+                # Wait up to 5 seconds for button to appear
+                accept_btn = await page.wait_for_selector(
+                    selector,
+                    timeout=5000,
+                    state='visible'
+                )
+                
+                if accept_btn:
+                    logger.debug(f"   Found cookie button: {selector}")
+                    await accept_btn.click()
+                    logger.debug(f"   ✓ Cookie button clicked")
+                    
+                    # Wait for consent to be saved
+                    await page.wait_for_timeout(1500)
+                    
+                    return True
+                    
+            except Exception:
+                # Selector not found, try next one
+                continue
+        
+        # No cookie banner found
+        return False
 
     def _detect_akamai_challenge(self, url: str, page_content: str) -> Tuple[bool, str]:
         """
