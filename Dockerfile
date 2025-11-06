@@ -1,133 +1,144 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.9
 
-# =============================================================================
-# Stage 1: Builder - Install dependencies
-# =============================================================================
+################################################################################
+# Build stage - install dependencies with uv
+################################################################################
 FROM python:3.12-slim AS builder
 
-ARG TARGETPLATFORM
-ARG BUILDPLATFORM
+SHELL ["sh", "-exc"]
 
-LABEL maintainer="your-email@example.com"
-LABEL org.opencontainers.image.source="https://github.com/thermostatic/aa-scraper"
-LABEL org.opencontainers.image.description="Production-ready American Airlines flight scraper"
-LABEL org.opencontainers.image.licenses="MIT"
+# Install system dependencies needed for compilation
+RUN <<EOT
+apt-get update -qy
+apt-get install -qyy \
+  -o APT::Install-Recommends=false \
+  -o APT::Install-Suggests=false \
+  build-essential \
+  ca-certificates \
+  curl \
+  git
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+EOT
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_DEFAULT_TIMEOUT=100
+# Install uv - the modern Python package installer
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    curl \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+# Configure uv for Docker
+ENV UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PYTHON=python3.12 \
+    UV_PROJECT_ENVIRONMENT=/app
 
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+# Synchronize dependencies ONLY (not the app yet) for better caching
+# This layer only rebuilds when uv.lock or pyproject.toml changes
+RUN --mount=type=cache,target=/root/.cache \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --locked --no-dev --no-install-project
 
-WORKDIR /build
-COPY pyproject.toml ./
+# Now install the application itself
+COPY . /src
+WORKDIR /src
+RUN --mount=type=cache,target=/root/.cache \
+    uv sync --locked --no-dev --no-editable
 
-RUN pip install --upgrade pip setuptools wheel && \
-    pip install -e .
-
-# =============================================================================
-# Stage 2: Development (OPTIONAL - moved before runtime)
-# =============================================================================
-FROM python:3.12-slim AS development
-
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PATH="/opt/venv/bin:$PATH" \
-    APP_HOME=/app \
-    COOKIES_DIR=/app/cookies \
-    OUTPUT_DIR=/app/output \
-    LOGS_DIR=/app/logs
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-    libdrm2 libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 \
-    libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
-    libasound2 libatspi2.0-0 libxshmfence1 ca-certificates \
-    fonts-liberation fonts-noto-color-emoji tzdata \
-    vim less procps \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /opt/venv /opt/venv
-
-RUN groupadd -r scraper --gid=1000 && \
-    useradd -r -g scraper --uid=1000 --home-dir=/app --shell=/bin/bash scraper
-
-RUN mkdir -p ${APP_HOME} ${COOKIES_DIR} ${OUTPUT_DIR} ${LOGS_DIR} && \
-    chown -R scraper:scraper ${APP_HOME}
-
-USER scraper
-WORKDIR ${APP_HOME}
-
-COPY --chown=scraper:scraper aa_scraper ./aa_scraper
-COPY --chown=scraper:scraper pyproject.toml ./
-
-USER root
-RUN pip install --no-cache-dir \
-    pytest pytest-asyncio pytest-cov black ruff mypy ipython
-USER scraper
-
-RUN python -m playwright install firefox && \
-    python -m playwright install-deps firefox 2>/dev/null || true
-
-VOLUME ["${COOKIES_DIR}", "${OUTPUT_DIR}", "${LOGS_DIR}"]
-
-# Dev entrypoint
-ENTRYPOINT ["/bin/bash"]
-CMD []
-
-# =============================================================================
-# Stage 3: Runtime (Production) - LAST STAGE = DEFAULT BUILD
-# =============================================================================
+################################################################################
+# Runtime stage - lean production image
+################################################################################
 FROM python:3.12-slim AS runtime
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PATH="/opt/venv/bin:$PATH" \
-    PLAYWRIGHT_BROWSERS_PATH=/opt/playwright \
-    APP_HOME=/app \
+SHELL ["sh", "-exc"]
+
+# Install runtime dependencies (Playwright/Camoufox needs these)
+RUN <<EOT
+apt-get update -qy
+apt-get install -qyy \
+  -o APT::Install-Recommends=false \
+  -o APT::Install-Suggests=false \
+  ca-certificates \
+  fonts-liberation \
+  fonts-noto-color-emoji \
+  libasound2 \
+  libatk-bridge2.0-0 \
+  libatk1.0-0 \
+  libatspi2.0-0 \
+  libcairo2 \
+  libcups2 \
+  libdbus-1-3 \
+  libdrm2 \
+  libgbm1 \
+  libnspr4 \
+  libnss3 \
+  libpango-1.0-0 \
+  libx11-6 \
+  libxcb1 \
+  libxcomposite1 \
+  libxdamage1 \
+  libxext6 \
+  libxfixes3 \
+  libxkbcommon0 \
+  libxrandr2 \
+  libxshmfence1 \
+  libgtk-3-0 \
+  libgdk-pixbuf-2.0-0 \
+  libglib2.0-0 \
+  libdbus-glib-1-2 \
+  tzdata
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+EOT
+
+# Create non-root user
+RUN <<EOT
+groupadd -r scraper --gid=1000
+useradd -r -d /app -g scraper --uid=1000 --shell=/bin/bash scraper
+EOT
+
+# Set up environment
+ENV PATH=/app/bin:$PATH \
+    PLAYWRIGHT_BROWSERS_PATH=/app/.cache/camoufox \
+    PYTHONUNBUFFERED=1 \
     COOKIES_DIR=/app/cookies \
     OUTPUT_DIR=/app/output \
     LOGS_DIR=/app/logs
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-    libdrm2 libdbus-1-3 libxkbcommon0 libxcomposite1 libxdamage1 \
-    libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 \
-    libasound2 libatspi2.0-0 libxshmfence1 ca-certificates \
-    fonts-liberation fonts-noto-color-emoji tzdata \
-    && rm -rf /var/lib/apt/lists/*
+# Copy the virtual environment from builder
+COPY --from=builder --chown=scraper:scraper /app /app
 
-COPY --from=builder /opt/venv /opt/venv
-
-RUN groupadd -r scraper --gid=1000 && \
-    useradd -r -g scraper --uid=1000 --home-dir=/app --shell=/bin/bash scraper
-
-RUN mkdir -p ${APP_HOME} ${COOKIES_DIR} ${OUTPUT_DIR} ${LOGS_DIR} && \
-    chown -R scraper:scraper ${APP_HOME}
+# Create necessary directories with proper permissions
+RUN mkdir -p /app/cookies /app/output /app/logs /app/.cache && \
+    chown -R scraper:scraper /app
 
 USER scraper
-WORKDIR ${APP_HOME}
+WORKDIR /app
 
-COPY --chown=scraper:scraper aa_scraper ./aa_scraper
-COPY --chown=scraper:scraper pyproject.toml ./
+# Pre-install Camoufox browser (Firefox) during build
+# This downloads the 713MB binary at build time, not runtime
+RUN python <<PYEOF
+from camoufox.sync_api import Camoufox
+import os
 
-RUN python -m playwright install firefox && \
-    python -m playwright install-deps firefox 2>/dev/null || true
+os.makedirs("/app/.cache/camoufox", exist_ok=True)
+print("📥 Downloading Camoufox browser (713MB)...")
 
-VOLUME ["${COOKIES_DIR}", "${OUTPUT_DIR}", "${LOGS_DIR}"]
+with Camoufox(headless=True) as browser:
+    page = browser.new_page()
+    page.goto("about:blank")
+    print("✓ Camoufox installed and verified successfully")
+PYEOF
 
-# Production entrypoint - THIS IS WHAT WE WANT!
+# Verify installation works
+RUN python -c "import aa_scraper; print(f'✓ aa_scraper v{aa_scraper.__version__} loaded successfully')"
+
+# Set up volumes for persistent data
+VOLUME ["/app/cookies", "/app/output", "/app/logs"]
+
+# Default entrypoint
 ENTRYPOINT ["python", "-m", "aa_scraper"]
 CMD ["--help"]
 
+# Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import aa_scraper; print('OK')" || exit 1
+    CMD python -c "import aa_scraper" || exit 1
