@@ -636,42 +636,6 @@ uv run python -m aa_scraper \
   --origin LAX --destination JFK --date 2025-12-15
 ```
 
-## 💣 Stress Testing
-
-If you're using Linux, it's pretty easy to test it with a script like this (& you can add other desinations/dates easily):
-```bash
-destinations=("JFK" "MIA" "ORD" "DFW")
-dates=("2025-12-15" "2025-12-16" "2025-12-17")
-
-MAX_PARALLEL=50  # Limit concurrent requests
-
-for dest in "${destinations[@]}"; do
-  for date in "${dates[@]}"; do
-    # Wait if we've hit max parallel jobs
-    while [ $(jobs -r | wc -l) -ge $MAX_PARALLEL ]; do
-      sleep 1
-    done
-
-    docker run --rm \
-      -v $(pwd)/cookies:/app/cookies \
-      -v $(pwd)/output:/app/output \
-      -v $(pwd)/logs:/app/logs \
-      thermostatic/aa-scraper:latest \
-      --origin LAX \
-      --destination "$dest" \
-      --date "$date" &
-
-    # Stagger startup
-    sleep 2
-  done
-done
-
-wait
-echo "All scraping completed!"
-```
-
-BUT BE CAREFUL! If you're not cautious you might end up using all of the RAM of your system. Make sure to run the scraper for a single location first or in cookie extraction mode, else you'll get each of the individual docker processes creating a Camoufox instance, and if you've got 12 different requests as in this example things aren't going to end up well for your poor computer. Talking from experience.
-
 **Docker Hub**
 🐳 https://hub.docker.com/repository/docker/thermostatic/aa-scraper
 
