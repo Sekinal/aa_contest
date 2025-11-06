@@ -194,9 +194,9 @@ class AAFlightClient:
         # Make request
         http2_enabled = http_version == "HTTP/2"
         limits = httpx.Limits(
-            max_keepalive_connections=5,
-            max_connections=10,
-            keepalive_expiry=30.0,
+            max_keepalive_connections=20,
+            max_connections=50,
+            keepalive_expiry=60.0,
         )
 
         async with httpx.AsyncClient(
