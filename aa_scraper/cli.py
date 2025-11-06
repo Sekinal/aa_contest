@@ -5,6 +5,7 @@ import asyncio
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+from itertools import product  # ADD THIS IMPORT
 
 from loguru import logger
 
@@ -105,6 +106,120 @@ async def scrape_flights(
     return results, raw_responses
 
 
+async def scrape_bulk_concurrent(
+    origins: List[str],
+    destinations: List[str],
+    dates: List[str],
+    passengers: int,
+    cookie_manager: CookieManager,
+    cabin_filter: str = "COACH",
+    search_types: List[str] = ["Award", "Revenue"],
+    rate_limit: float = DEFAULT_RATE_LIMIT,
+    max_concurrent: int = 10,
+) -> List[Tuple[str, str, str, Dict, Dict]]:
+    """
+    Scrape multiple origin-destination-date combinations concurrently.
+    
+    Args:
+        origins: List of origin airport codes
+        destinations: List of destination airport codes
+        dates: List of departure dates (YYYY-MM-DD)
+        passengers: Number of passengers
+        cookie_manager: Cookie manager instance
+        cabin_filter: Cabin class filter
+        search_types: List of search types (Award, Revenue)
+        rate_limit: Rate limit in requests per second
+        max_concurrent: Maximum concurrent route/date combinations
+    
+    Returns:
+        List of (origin, destination, date, results, raw_responses) tuples
+    """
+    # Generate all combinations
+    combinations = list(product(origins, destinations, dates))
+    total = len(combinations)
+    
+    logger.info("=" * 80)
+    logger.info(f"🚀 BULK CONCURRENT SCRAPING MODE")
+    logger.info("=" * 80)
+    logger.info(f"Origins:       {', '.join(origins)}")
+    logger.info(f"Destinations:  {', '.join(destinations)}")
+    logger.info(f"Dates:         {', '.join(dates)}")
+    logger.info(f"Total combos:  {total}")
+    logger.info(f"Max concurrent: {max_concurrent}")
+    logger.info(f"Search types:  {', '.join(search_types)}")
+    logger.info("=" * 80)
+    logger.info("")
+    
+    # Semaphore to limit concurrent tasks
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def scrape_single_combo(origin: str, dest: str, date: str):
+        """Scrape a single origin-destination-date combination"""
+        async with semaphore:
+            try:
+                logger.info(f"🔍 Starting: {origin} → {dest} on {date}")
+                
+                results, raw_responses = await scrape_flights(
+                    origin=origin,
+                    destination=dest,
+                    date=date,
+                    passengers=passengers,
+                    cookie_manager=cookie_manager,
+                    cabin_filter=cabin_filter,
+                    search_types=search_types,
+                    rate_limit=rate_limit,
+                )
+                
+                # Count successful results
+                success_count = sum(1 for r in results.values() if r is not None)
+                total_flights = sum(len(r) for r in results.values() if r is not None)
+                
+                logger.success(
+                    f"✅ Completed: {origin} → {dest} on {date} "
+                    f"({success_count}/{len(search_types)} searches, {total_flights} flights)"
+                )
+                
+                return (origin, dest, date, results, raw_responses)
+                
+            except Exception as e:
+                logger.error(f"❌ Failed: {origin} → {dest} on {date}: {e}")
+                return (origin, dest, date, None, None)
+    
+    # Create tasks for all combinations
+    tasks = [
+        scrape_single_combo(origin, dest, date)
+        for origin, dest, date in combinations
+    ]
+    
+    # Execute all tasks concurrently
+    logger.info(f"⚡ Executing {total} combinations with max {max_concurrent} concurrent...")
+    logger.info("")
+    
+    start_time = asyncio.get_event_loop().time()
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    end_time = asyncio.get_event_loop().time()
+    
+    duration = end_time - start_time
+    
+    # Summary
+    successful = sum(1 for r in results if r[3] is not None)
+    failed = total - successful
+    
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("✅ BULK SCRAPING COMPLETE")
+    logger.info("=" * 80)
+    logger.info(f"Total combinations: {total}")
+    logger.info(f"Successful:        {successful}")
+    logger.info(f"Failed:            {failed}")
+    logger.info(f"Duration:          {duration:.1f}s")
+    logger.info(f"Avg per combo:     {duration/total:.1f}s")
+    logger.info("=" * 80)
+    logger.info("")
+    
+    return results
+
+
 def main() -> None:
     """Main CLI entry point"""
     parser = argparse.ArgumentParser(
@@ -167,6 +282,32 @@ def main() -> None:
         help="Search types",
     )
 
+    # Bulk search options
+    search_group.add_argument(
+        "--origins", 
+        type=str, 
+        nargs="+", 
+        help="Multiple origin airport codes for bulk search"
+    )
+    search_group.add_argument(
+        "--destinations", 
+        type=str, 
+        nargs="+", 
+        help="Multiple destination airport codes for bulk search"
+    )
+    search_group.add_argument(
+        "--dates", 
+        type=str, 
+        nargs="+", 
+        help="Multiple departure dates (YYYY-MM-DD) for bulk search"
+    )
+    search_group.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=10,
+        help="Maximum concurrent route/date combinations for bulk search (default: 10)"
+    )
+
     # Configuration
     config_group = parser.add_argument_group("Configuration")
     config_group.add_argument(
@@ -215,67 +356,135 @@ def main() -> None:
                 logger.success("Cookie extraction complete!")
                 return
 
-            # Validate search parameters
-            if not all([args.origin, args.destination, args.date]):
-                logger.error("Missing required: --origin, --destination, --date")
-                sys.exit(1)
+            # Check if bulk mode
+            is_bulk_mode = bool(args.origins or args.destinations or args.dates)
+            
+            if is_bulk_mode:
+                # Bulk mode validation
+                origins = args.origins or ([args.origin] if args.origin else None)
+                destinations = args.destinations or ([args.destination] if args.destination else None)
+                dates = args.dates or ([args.date] if args.date else None)
+                
+                if not all([origins, destinations, dates]):
+                    logger.error(
+                        "Bulk mode requires at least one of: "
+                        "--origins, --destinations, --dates (or use --origin/--destination/--date)"
+                    )
+                    sys.exit(1)
+                
+                # Extract cookies if requested
+                if args.extract_cookies:
+                    await cookie_manager.get_cookies(
+                        force_refresh=True,
+                        headless=not args.no_headless,
+                        wait_time=args.cookie_wait_time,
+                    )
+                
+                # Run bulk scraping
+                bulk_results = await scrape_bulk_concurrent(
+                    origins=[o.upper() for o in origins],
+                    destinations=[d.upper() for d in destinations],
+                    dates=dates,
+                    passengers=args.passengers,
+                    cookie_manager=cookie_manager,
+                    cabin_filter=args.cabin,
+                    search_types=args.search_type,
+                    rate_limit=args.rate_limit,
+                    max_concurrent=args.max_concurrent,
+                )
+                
+                # Save all results
+                output_dir = Path(args.output)
+                
+                successful_count = 0
+                for origin, dest, date, results, raw_responses in bulk_results:
+                    if results is None:
+                        continue
+                    
+                    try:
+                        save_results(
+                            results,
+                            raw_responses,
+                            output_dir,
+                            origin,
+                            dest,
+                            date,
+                            args.passengers,
+                            args.cabin,
+                        )
+                        successful_count += 1
+                    except Exception as e:
+                        logger.error(f"Failed to save {origin}→{dest} on {date}: {e}")
+                
+                # Final summary
+                logger.info("")
+                logger.info("=" * 80)
+                logger.success(f"✓ Bulk scraping complete! Saved {successful_count} result sets")
+                logger.info(f"  Output directory: {output_dir}")
+                logger.info("=" * 80)
+                
+            else:
+                # Original single-route mode
+                if not all([args.origin, args.destination, args.date]):
+                    logger.error("Missing required: --origin, --destination, --date")
+                    sys.exit(1)
 
-            # Extract cookies if requested
-            if args.extract_cookies:
-                await cookie_manager.get_cookies(
-                    force_refresh=True,
-                    headless=not args.no_headless,
-                    wait_time=args.cookie_wait_time,
+                # Extract cookies if requested
+                if args.extract_cookies:
+                    await cookie_manager.get_cookies(
+                        force_refresh=True,
+                        headless=not args.no_headless,
+                        wait_time=args.cookie_wait_time,
+                    )
+
+                # Search flights
+                logger.info(
+                    f"Searching flights: {args.origin} → {args.destination} on {args.date}"
                 )
 
-            # Search flights
-            logger.info(
-                f"Searching flights: {args.origin} → {args.destination} on {args.date}"
-            )
+                results, raw_responses = await scrape_flights(
+                    origin=args.origin.upper(),
+                    destination=args.destination.upper(),
+                    date=args.date,
+                    passengers=args.passengers,
+                    cookie_manager=cookie_manager,
+                    cabin_filter=args.cabin,
+                    search_types=args.search_type,
+                    rate_limit=args.rate_limit,
+                )
 
-            results, raw_responses = await scrape_flights(
-                origin=args.origin.upper(),
-                destination=args.destination.upper(),
-                date=args.date,
-                passengers=args.passengers,
-                cookie_manager=cookie_manager,
-                cabin_filter=args.cabin,
-                search_types=args.search_type,
-                rate_limit=args.rate_limit,
-            )
+                # Check results
+                if not any(results.values()):
+                    logger.error("All searches failed")
+                    sys.exit(1)
 
-            # Check results
-            if not any(results.values()):
-                logger.error("All searches failed")
-                sys.exit(1)
+                # Save results
+                output_dir = Path(args.output)
+                save_results(
+                    results,
+                    raw_responses,
+                    output_dir,
+                    args.origin,
+                    args.destination,
+                    args.date,
+                    args.passengers,
+                    args.cabin,
+                )
 
-            # Save results
-            output_dir = Path(args.output)
-            save_results(
-                results,
-                raw_responses,
-                output_dir,
-                args.origin,
-                args.destination,
-                args.date,
-                args.passengers,
-                args.cabin,
-            )
+                # Summary
+                logger.info("")
+                logger.info("=" * 60)
+                logger.success("✓ Scraping complete!")
+                logger.info(f"  Route: {args.origin} → {args.destination}")
+                logger.info(f"  Date: {args.date}")
+                logger.info(f"  Cabin: {CABIN_CLASS_MAP.get(args.cabin, args.cabin.lower())}")
 
-            # Summary
-            logger.info("")
-            logger.info("=" * 60)
-            logger.success("✓ Scraping complete!")
-            logger.info(f"  Route: {args.origin} → {args.destination}")
-            logger.info(f"  Date: {args.date}")
-            logger.info(f"  Cabin: {CABIN_CLASS_MAP.get(args.cabin, args.cabin.lower())}")
+                for search_type, result in results.items():
+                    if result:
+                        logger.info(f"  {search_type}: {len(result)} flights")
 
-            for search_type, result in results.items():
-                if result:
-                    logger.info(f"  {search_type}: {len(result)} flights")
-
-            logger.info(f"  Output: {output_dir}")
-            logger.info("=" * 60)
+                logger.info(f"  Output: {output_dir}")
+                logger.info("=" * 60)
 
         except KeyboardInterrupt:
             logger.warning("Interrupted by user")
