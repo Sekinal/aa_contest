@@ -115,7 +115,7 @@ async def scrape_bulk_concurrent(
     cabin_filter: str = "COACH",
     search_types: List[str] = ["Award", "Revenue"],
     rate_limit: float = DEFAULT_RATE_LIMIT,
-    max_concurrent: int = 10,
+    max_concurrent: int = 5,
 ) -> List[Tuple[str, str, str, Dict, Dict]]:
     """
     Scrape multiple origin-destination-date combinations concurrently.
@@ -304,7 +304,7 @@ def main() -> None:
     search_group.add_argument(
         "--max-concurrent",
         type=int,
-        default=10,
+        default=5,
         help="Maximum concurrent route/date combinations for bulk search (default: 10)"
     )
 
