@@ -265,7 +265,8 @@ class AAFlightClient:
         async def on_retry_callback(attempt: int, error: Exception):
             """Handle retry attempts"""
             from .retry import classify_error
-
+            from .models import ErrorType
+            
             error_type = classify_error(error)
 
             if error_type == ErrorType.AUTH_FAILURE:
