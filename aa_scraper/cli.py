@@ -43,61 +43,65 @@ async def scrape_flights(
         destination: Destination airport code
         date: Departure date (YYYY-MM-DD)
         passengers: Number of passengers
-        cookiemanager: Cookie manager instance
-        cabinfilter: Cabin class filter
-        searchtypes: List of search types (Award, Revenue)
-        ratelimit: Rate limit in requests per second
+        cookie_manager: Cookie manager instance
+        cabin_filter: Cabin class filter
+        search_types: List of search types (Award, Revenue)
+        rate_limit: Rate limit in requests per second
     
     Returns:
-        Tuple of (results, rawresponses)
+        Tuple of (results, raw_responses)
     """
     rate_limiter = AdaptiveRateLimiter(rate=rate_limit, burst=int(rate_limit * 2))
-    client = AAFlightClient(cookie_manager, rate_limiter, timeout=DEFAULT_REQUEST_TIMEOUT)
     
-    results = {}
-    raw_responses = {}
-    
-    # Create tasks for concurrent execution
-    tasks = []
-    for search_type in search_types:
-        logger.info(f"Preparing {search_type} search...")
-        task = client.search_flights(
-            origin, destination, date, passengers, search_type
-        )
-        tasks.append((search_type, task))
-    
-    # Execute all searches concurrently
-    logger.info(f"Executing {len(tasks)} searches concurrently...")
-    responses = await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
-    
-    # Process results
-    for (search_type, _), api_response in zip(tasks, responses):
-        if isinstance(api_response, Exception):
-            logger.error(f"{search_type} search failed with exception: {api_response}")
-            results[search_type] = None
-            raw_responses[search_type] = None
-            continue
+    # Use async context manager for proper cleanup
+    async with AAFlightClient(
+        cookie_manager, rate_limiter, timeout=DEFAULT_REQUEST_TIMEOUT
+    ) as client:
+        results = {}
+        raw_responses = {}
+        
+        # Create tasks for concurrent execution
+        tasks = []
+        for search_type in search_types:
+            logger.info(f"Preparing {search_type} search...")
+            task = client.search_flights(
+                origin, destination, date, passengers, search_type
+            )
+            tasks.append((search_type, task))
+        
+        # Execute all searches concurrently
+        logger.info(f"Executing {len(tasks)} searches concurrently...")
+        responses = await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
+        
+        # Process results
+        for (search_type, _), api_response in zip(tasks, responses):
+            if isinstance(api_response, Exception):
+                logger.error(f"{search_type} search failed with exception: {api_response}")
+                results[search_type] = None
+                raw_responses[search_type] = None
+                continue
+                
+            raw_responses[search_type] = api_response
             
-        raw_responses[search_type] = api_response
-        
-        if not api_response:
-            logger.warning(f"{search_type} search returned no data")
-            results[search_type] = None
-            continue
-        
-        # Parse flights
-        flights = FlightDataParser.parse_flight_options(
-            api_response, cabin_filter=cabin_filter, search_type=search_type
-        )
-        
-        if not flights:
-            logger.warning(f"No {cabin_filter} flights found in {search_type} response")
-            results[search_type] = None
-            continue
-        
-        logger.success(f"Found {len(flights)} {search_type} flights")
-        results[search_type] = flights
+            if not api_response:
+                logger.warning(f"{search_type} search returned no data")
+                results[search_type] = None
+                continue
+            
+            # Parse flights
+            flights = FlightDataParser.parse_flight_options(
+                api_response, cabin_filter=cabin_filter, search_type=search_type
+            )
+            
+            if not flights:
+                logger.warning(f"No {cabin_filter} flights found in {search_type} response")
+                results[search_type] = None
+                continue
+            
+            logger.success(f"Found {len(flights)} {search_type} flights")
+            results[search_type] = flights
     
+    # Client is automatically closed here
     return results, raw_responses
 
 

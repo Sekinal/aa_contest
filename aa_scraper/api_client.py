@@ -21,6 +21,7 @@ class AAFlightClient:
     - Circuit breaker pattern
     - Exponential backoff retry
     - Request health checks
+    - Persistent HTTP client connections
     """
 
     def __init__(
@@ -42,8 +43,43 @@ class AAFlightClient:
         self.timeout = timeout
         self.circuit_breaker = CircuitBreaker(name="aa_api")
         self.session_start = datetime.now()
+        
+        # Create persistent HTTP clients (one for HTTP/2, one for HTTP/1.1)
+        limits = httpx.Limits(
+            max_keepalive_connections=20,
+            max_connections=50,
+            keepalive_expiry=60.0,
+        )
+        
+        self._client_http2 = httpx.AsyncClient(
+            timeout=self.timeout,
+            limits=limits,
+            http2=True,
+            follow_redirects=True,
+        )
+        
+        self._client_http1 = httpx.AsyncClient(
+            timeout=self.timeout,
+            limits=limits,
+            http2=False,
+            follow_redirects=True,
+        )
 
-        logger.info("Flight client initialized with auto-recovery")
+        logger.info("Flight client initialized with auto-recovery and persistent connections")
+
+    async def close(self):
+        """Close HTTP clients and cleanup resources"""
+        await self._client_http2.aclose()
+        await self._client_http1.aclose()
+        logger.info("Flight client closed")
+
+    async def __aenter__(self):
+        """Async context manager entry"""
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit"""
+        await self.close()
 
     def _build_headers(
         self,
@@ -180,7 +216,7 @@ class AAFlightClient:
         search_type: str,
         http_version: str = "HTTP/2",
     ) -> Dict[str, Any]:
-        """Make a single API request"""
+        """Make a single API request using persistent client"""
         # Get fresh cookies
         cookies, captured_headers, referer = await self.cookie_manager.get_cookies()
         headers = self._build_headers(cookies, captured_headers, referer)
@@ -191,47 +227,40 @@ class AAFlightClient:
         # Acquire rate limit token
         await self.rate_limiter.acquire()
 
-        # Make request
-        http2_enabled = http_version == "HTTP/2"
-        limits = httpx.Limits(
-            max_keepalive_connections=20,
-            max_connections=50,
-            keepalive_expiry=60.0,
+        # Select appropriate persistent client
+        client = self._client_http2 if http_version == "HTTP/2" else self._client_http1
+
+        logger.info(
+            f"🔍 {search_type}: {origin} → {destination} on {date} (via {http_version})"
         )
 
-        async with httpx.AsyncClient(
-            cookies=cookies,
+        # Make request with persistent client (pass cookies and headers per-request)
+        response = await client.post(
+            API_ENDPOINT,
+            json=payload,
             headers=headers,
-            timeout=self.timeout,
-            limits=limits,
-            http2=http2_enabled,
-            follow_redirects=True,
-        ) as client:
-            logger.info(
-                f"🔍 {search_type}: {origin} → {destination} on {date} (via {http_version})"
-            )
+            cookies=cookies,
+        )
 
-            response = await client.post(API_ENDPOINT, json=payload)
+        logger.debug(f"Response: {response.status_code}")
 
-            logger.debug(f"Response: {response.status_code}")
+        # Handle specific status codes
+        if response.status_code == 403:
+            logger.warning("Got 403 - bot detection triggered")
+            raise CookieExpiredError("403 Forbidden - cookies may be invalid")
 
-            # Handle specific status codes
-            if response.status_code == 403:
-                logger.warning("Got 403 - bot detection triggered")
-                raise CookieExpiredError("403 Forbidden - cookies may be invalid")
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 60))
+            logger.warning(f"Rate limited - retry after {retry_after}s")
+            await self.rate_limiter.backoff(retry_after)
+            raise RateLimitError(f"Rate limited, retry after {retry_after}s")
 
-            if response.status_code == 429:
-                retry_after = int(response.headers.get("Retry-After", 60))
-                logger.warning(f"Rate limited - retry after {retry_after}s")
-                await self.rate_limiter.backoff(retry_after)
-                raise RateLimitError(f"Rate limited, retry after {retry_after}s")
+        response.raise_for_status()
 
-            response.raise_for_status()
+        # Success - recover rate limiter
+        await self.rate_limiter.recover()
 
-            # Success - recover rate limiter
-            await self.rate_limiter.recover()
-
-            return response.json()
+        return response.json()
 
     async def search_flights(
         self,
