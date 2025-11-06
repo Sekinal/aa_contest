@@ -27,7 +27,7 @@ class AAFlightClient:
         self,
         cookie_manager: CookieManager,
         rate_limiter: AdaptiveRateLimiter,
-        timeout: float = 30.0,
+        timeout: float = 10.0,
     ):
         """
         Initialize API client.
