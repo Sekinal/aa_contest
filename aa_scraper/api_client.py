@@ -217,6 +217,7 @@ class AAFlightClient:
         # Create fresh AsyncSession with Firefox impersonation
         async with AsyncSession(impersonate=self.impersonate) as session:
             start_time = time.time()
+            response_size = 0
             try:
                 response = await session.post(
                     API_ENDPOINT,
@@ -226,6 +227,10 @@ class AAFlightClient:
                     timeout=self.timeout,
                 )
                 request_duration = time.time() - start_time
+                
+                # Track response size
+                response_size = len(response.content) if response.content else 0
+
                 logger.debug(f"   ← Response {response.status_code} ({request_duration:.2f}s)")
                 logger.debug(f"   ← Content-Type: {response.headers.get('content-type', 'unknown')}")
 
@@ -305,7 +310,13 @@ class AAFlightClient:
         # Tell rate limiter we finished successfully
         await self.rate_limiter.recover()
 
-        return data
+        metrics = {
+            'response_time': request_duration,
+            'response_bytes': response_size,
+            'status_code': response.status_code,
+        }
+        
+        return data, metrics
 
     def _detect_permission_denied_in_response(self, response_text: str) -> bool:
         """

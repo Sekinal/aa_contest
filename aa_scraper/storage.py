@@ -255,7 +255,9 @@ async def save_results_streaming(
     storage = AsyncStreamingStorage(output_dir)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     
-    # Save raw responses asynchronously (in parallel!)
+    total_bytes = 0
+    
+    # Save raw responses and track sizes
     raw_save_tasks = []
     for search_type, raw_data in raw_responses.items():
         if raw_data is not None:
@@ -263,12 +265,13 @@ async def save_results_streaming(
                 raw_data, origin, destination, date, search_type, timestamp
             )
             raw_save_tasks.append(task)
-            # Clear reference
-            raw_responses[search_type] = None
     
-    # Wait for all raw saves to complete (parallel!)
     if raw_save_tasks:
-        await asyncio.gather(*raw_save_tasks)
+        saved_files = await asyncio.gather(*raw_save_tasks)
+        # Get file sizes
+        for file_path in saved_files:
+            if file_path.exists():
+                total_bytes += file_path.stat().st_size
     
     # Clear dict
     del raw_responses
@@ -290,7 +293,10 @@ async def save_results_streaming(
     results.clear()
     gc.collect()
     
-    return output_file, num_flights
+    if output_file.exists():
+        total_bytes += output_file.stat().st_size
+    
+    return output_file, num_flights, total_bytes
 
 
 # Backwards compatibility wrapper

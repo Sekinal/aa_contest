@@ -102,9 +102,14 @@ async def scrape_flights(
                 continue
             
             # Parse flights
-            flights = FlightDataParser.parse_flight_options(
-                api_response, cabin_filter=cabin_filter, search_type=search_type
-            )
+            try:
+                flights = FlightDataParser.parse_flight_options(
+                    api_response, cabin_filter=cabin_filter, search_type=search_type
+                )
+            except Exception as e:
+                logger.warning(f"Failed to parse {search_type} flights: {e}")
+                results[search_type] = None
+                continue
             
             if not flights:
                 logger.warning(f"No {cabin_filter} flights found in {search_type} response")
@@ -116,6 +121,108 @@ async def scrape_flights(
     
     # Client is automatically closed here
     return results, raw_responses
+
+
+async def scrape_flights_with_metrics(
+    origin: str,
+    destination: str,
+    date: str,
+    passengers: int,
+    cookie_manager: CookieManager,
+    cabin_filter: str = "COACH",
+    search_types: List[str] = ["Award", "Revenue"],
+    rate_limit: float = DEFAULT_RATE_LIMIT,
+) -> Tuple[Dict, Dict, Dict]:
+    """
+    Scrape flights with metrics tracking.
+    
+    Args:
+        origin: Origin airport code
+        destination: Destination airport code
+        date: Departure date (YYYY-MM-DD)
+        passengers: Number of passengers
+        cookie_manager: Cookie manager instance
+        cabin_filter: Cabin class filter
+        search_types: List of search types (Award, Revenue)
+        rate_limit: Rate limit in requests per second
+    
+    Returns:
+        Tuple of (results, raw_responses, metrics_dict)
+    """
+    rate_limiter = AdaptiveRateLimiter(rate=rate_limit, burst=int(rate_limit * 2))
+    
+    # Initialize metrics tracking
+    metrics = {
+        'api_requests': 0,
+        'responses_bytes': 0,
+        'retries': 0,
+        'response_times': [],
+        'cookie_refreshes': 0,
+    }
+    
+    async with AAFlightClient(cookie_manager, rate_limiter, timeout=DEFAULT_REQUEST_TIMEOUT) as client:
+        results = {}
+        raw_responses = {}
+        
+        for search_type in search_types:
+            try:
+                metrics['api_requests'] += 1
+                
+                # Track cookie refreshes
+                if hasattr(cookie_manager, 'consecutive_failures'):
+                    old_failures = cookie_manager.consecutive_failures
+                
+                # Make request and get metrics
+                api_response = await client.search_flights(
+                    origin, destination, date, passengers, search_type
+                )
+                
+                raw_responses[search_type] = api_response
+                
+                # Count response bytes
+                if api_response:
+                    import json
+                    response_json = json.dumps(api_response)
+                    metrics['responses_bytes'] += len(response_json.encode())
+                
+                # Check if cookies were refreshed
+                if hasattr(cookie_manager, 'consecutive_failures'):
+                    if cookie_manager.consecutive_failures == 0 and old_failures > 0:
+                        metrics['cookie_refreshes'] += 1
+                
+                if not api_response:
+                    logger.warning(f"{search_type} search returned no data")
+                    results[search_type] = None
+                    continue
+                
+                # Parse flights
+                try:
+                    flights = FlightDataParser.parse_flight_options(
+                        api_response, cabin_filter=cabin_filter, search_type=search_type
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to parse {search_type} flights: {e}")
+                    results[search_type] = None
+                    continue
+                
+                if not flights:
+                    logger.warning(f"No {cabin_filter} flights found in {search_type} response")
+                    results[search_type] = None
+                    continue
+                
+                logger.success(f"Found {len(flights)} {search_type} flights")
+                results[search_type] = flights
+            
+            except Exception as e:
+                logger.error(f"{search_type} search failed: {e}")
+                results[search_type] = None
+                raw_responses[search_type] = None
+                
+                # Track retry attempts
+                if hasattr(cookie_manager, 'consecutive_failures'):
+                    metrics['retries'] += cookie_manager.consecutive_failures
+    
+    return results, raw_responses, metrics
 
 
 async def scrape_bulk_concurrent(
@@ -133,7 +240,7 @@ async def scrape_bulk_concurrent(
 ) -> Dict[str, Any]:
     """
     Memory-efficient bulk scraping with streaming storage.
-    Saves each result immediately instead of accumulating in RAM.
+    Includes comprehensive metrics tracking.
     
     Args:
         origins: List of origin airport codes
@@ -174,9 +281,10 @@ async def scrape_bulk_concurrent(
     if using_pool:
         logger.info(f"🚀 MULTI-BROWSER BULK CONCURRENT SCRAPING (Memory-Efficient)")
         logger.info("=" * 80)
-        logger.info(f"Browsers:      {cookie_pool.num_browsers}")
+        num_browsers = cookie_pool.num_browsers
+        logger.info(f"Browsers:      {num_browsers}")
         logger.info(f"Per-browser:   {cookie_pool.max_concurrent_per_browser} concurrent")
-        logger.info(f"Total max:     {cookie_pool.num_browsers * cookie_pool.max_concurrent_per_browser} concurrent")
+        logger.info(f"Total max:     {num_browsers * cookie_pool.max_concurrent_per_browser} concurrent")
     else:
         logger.info(f"🚀 SINGLE-BROWSER BULK CONCURRENT SCRAPING (Memory-Efficient)")
         logger.info("=" * 80)
@@ -213,12 +321,19 @@ async def scrape_bulk_concurrent(
         'failed': 0,
         'total_flights': 0,
         'start_time': asyncio.get_event_loop().time(),
+        # 🆕 NEW METRICS
+        'total_api_requests': 0,        # Total API calls made
+        'total_responses_bytes': 0,     # Data downloaded from API
+        'total_saved_bytes': 0,         # Data saved to disk
+        'failed_retries': 0,            # Total retry attempts
+        'average_response_times': [],    # Response times for averaging
+        'cookie_refreshes': 0,          # Times cookies were refreshed
     }
     stats_lock = asyncio.Lock()
     
     async def scrape_and_save_single_combo(task_id: int, origin: str, dest: str, date: str):
         """
-        Scrape a single combination and save immediately.
+        Scrape a single combination and save immediately with metrics tracking.
         This function does NOT return large data - everything is streamed to disk.
         """
         # Get cookie manager for this task
@@ -238,8 +353,11 @@ async def scrape_bulk_concurrent(
                 browser_prefix = f"[Browser #{browser_id}] " if browser_id is not None else ""
                 logger.info(f"{browser_prefix}🔍 Starting: {origin} → {dest} on {date}")
                 
-                # Scrape flights
-                results, raw_responses = await scrape_flights(
+                # Track start time
+                combo_start = asyncio.get_event_loop().time()
+                
+                # Scrape flights with metrics
+                results, raw_responses, task_metrics = await scrape_flights_with_metrics(
                     origin=origin,
                     destination=dest,
                     date=date,
@@ -249,6 +367,16 @@ async def scrape_bulk_concurrent(
                     search_types=search_types,
                     rate_limit=rate_limit,
                 )
+                
+                combo_duration = asyncio.get_event_loop().time() - combo_start
+                
+                # Update global stats with task metrics
+                async with stats_lock:
+                    stats['total_api_requests'] += task_metrics['api_requests']
+                    stats['total_responses_bytes'] += task_metrics['responses_bytes']
+                    stats['failed_retries'] += task_metrics['retries']
+                    stats['average_response_times'].extend(task_metrics.get('response_times', []))
+                    stats['cookie_refreshes'] += task_metrics.get('cookie_refreshes', 0)
                 
             except Exception as e:
                 async with stats_lock:
@@ -260,7 +388,9 @@ async def scrape_bulk_concurrent(
         
         # ✅ SAVE OUTSIDE SEMAPHORE - Don't block other scrapers!
         try:
-            output_file, num_flights = await save_results_streaming(
+            save_start = asyncio.get_event_loop().time()
+            
+            output_file, num_flights, saved_bytes = await save_results_streaming(
                 results,
                 raw_responses,
                 output_dir,
@@ -271,6 +401,8 @@ async def scrape_bulk_concurrent(
                 cabin_filter,
             )
             
+            save_duration = asyncio.get_event_loop().time() - save_start
+            
             # Clear memory
             del results
             del raw_responses
@@ -280,11 +412,14 @@ async def scrape_bulk_concurrent(
             async with stats_lock:
                 stats['successful'] += 1
                 stats['total_flights'] += num_flights
+                stats['total_saved_bytes'] += saved_bytes
             
+            # Log completion with timing info
             browser_prefix = f"[Browser #{browser_id}] " if browser_id is not None else ""
             logger.success(
                 f"{browser_prefix}✅ Completed: {origin} → {dest} on {date} "
-                f"({len(search_types)} searches, {num_flights} flights saved)"
+                f"({len(search_types)} searches, {num_flights} flights saved) "
+                f"API: {combo_duration:.2f}s, Save: {save_duration:.2f}s"
             )
             
             return True
@@ -305,7 +440,7 @@ async def scrape_bulk_concurrent(
     
     # Execute all tasks concurrently
     if using_pool:
-        logger.info(f"⚡ Executing {total} combinations across {cookie_pool.num_browsers} browsers...")
+        logger.info(f"⚡ Executing {total} combinations across {num_browsers} browsers...")
     else:
         logger.info(f"⚡ Executing {total} combinations with max {max_concurrent} concurrent...")
     logger.info("")
@@ -316,23 +451,74 @@ async def scrape_bulk_concurrent(
     end_time = asyncio.get_event_loop().time()
     duration = end_time - stats['start_time']
     
-    # Summary
+    # Calculate final metrics
+    req_per_sec = stats['total_api_requests'] / duration if duration > 0 else 0
+    
+    # Calculate average response time
+    avg_response_time = (
+        sum(stats['average_response_times']) / len(stats['average_response_times'])
+        if stats['average_response_times'] else 0
+    )
+    
+    # Format data sizes helper
+    def format_bytes(bytes_val):
+        """Format bytes to human readable"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if bytes_val < 1024.0:
+                return f"{bytes_val:.2f} {unit}"
+            bytes_val /= 1024.0
+        return f"{bytes_val:.2f} TB"
+    
+    # Calculate compression ratio
+    compression_ratio = (
+        stats['total_saved_bytes'] / stats['total_responses_bytes'] * 100
+        if stats['total_responses_bytes'] > 0 else 0
+    )
+    
+    # 🆕 ENHANCED SUMMARY OUTPUT
     logger.info("")
     logger.info("=" * 80)
     logger.success("✅ BULK SCRAPING COMPLETE")
     logger.info("=" * 80)
-    logger.info(f"Total combinations: {total}")
-    logger.info(f"Successful:        {stats['successful']}")
-    logger.info(f"Failed:            {stats['failed']}")
-    logger.info(f"Total flights:     {stats['total_flights']}")
-    logger.info(f"Duration:          {duration:.1f}s")
-    logger.info(f"Avg per combo:     {duration/total:.1f}s")
+    logger.info("")
+    logger.info("📊 RESULTS")
+    logger.info(f"   Total combinations:    {total}")
+    logger.info(f"   ✅ Successful:         {stats['successful']}")
+    logger.info(f"   ❌ Failed:             {stats['failed']}")
+    logger.info(f"   ✈️  Total flights:      {stats['total_flights']}")
+    logger.info("")
+    logger.info("⏱️  PERFORMANCE")
+    logger.info(f"   Total duration:        {duration:.1f}s")
+    logger.info(f"   Avg per combo:         {duration/total:.2f}s")
+    logger.info(f"   Requests/second:       {req_per_sec:.2f} req/s")
+    logger.info(f"   Avg response time:     {avg_response_time*1000:.0f}ms")
+    logger.info(f"   Cookie refreshes:      {stats['cookie_refreshes']}")
+    logger.info(f"   Failed retries:        {stats['failed_retries']}")
+    logger.info("")
+    logger.info("💾 DATA TRANSFER")
+    logger.info(f"   API requests made:     {stats['total_api_requests']}")
+    logger.info(f"   Data downloaded:       {format_bytes(stats['total_responses_bytes'])}")
+    logger.info(f"   Data saved to disk:    {format_bytes(stats['total_saved_bytes'])}")
+    logger.info(f"   Compression ratio:     {compression_ratio:.1f}%")
+    if stats['total_api_requests'] > 0:
+        logger.info(f"   Avg per request:       {format_bytes(stats['total_responses_bytes'] / req_per_sec) if req_per_sec > 0 else 'N/A'}")
     
     if using_pool:
-        logger.info(f"Effective rate:    {stats['successful']/duration:.1f} combos/sec")
+        logger.info("")
+        logger.info("🔥 CONCURRENCY")
+        logger.info(f"   Browsers used:         {num_browsers}")
+        logger.info(f"   Max per browser:       {cookie_pool.max_concurrent_per_browser}")
+        logger.info(f"   Total concurrency:     {num_browsers * cookie_pool.max_concurrent_per_browser}")
+        logger.info(f"   Effective rate:        {stats['successful']/duration:.2f} combos/sec")
         logger.info("")
         cookie_pool.print_stats()
+    else:
+        logger.info("")
+        logger.info("🔥 CONCURRENCY")
+        logger.info(f"   Max concurrent:        {max_concurrent}")
+        logger.info(f"   Effective rate:        {stats['successful']/duration:.2f} combos/sec")
     
+    logger.info("")
     logger.info("=" * 80)
     logger.info("")
     
