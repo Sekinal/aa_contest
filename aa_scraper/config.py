@@ -31,7 +31,7 @@ CABIN_CLASS_MAP = {
 }
 
 # Rate limiting defaults
-DEFAULT_RATE_LIMIT = 50.0  # Requests per second
+DEFAULT_RATE_LIMIT = 5.0  # Requests per second
 DEFAULT_BURST = 25  # Burst capacity
 
 # Timeouts
