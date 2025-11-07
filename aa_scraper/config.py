@@ -31,11 +31,11 @@ CABIN_CLASS_MAP = {
 }
 
 # Rate limiting defaults
-DEFAULT_RATE_LIMIT = 10.0  # Requests per second
-DEFAULT_BURST = 20  # Burst capacity
+DEFAULT_RATE_LIMIT = 50.0  # Requests per second
+DEFAULT_BURST = 25  # Burst capacity
 
 # Timeouts
-DEFAULT_REQUEST_TIMEOUT = 10.0  # Seconds
+DEFAULT_REQUEST_TIMEOUT = 20.0  # Seconds
 DEFAULT_COOKIE_WAIT_TIME = 15  # Seconds
 
 # Test flight parameters for cookie validation
