@@ -286,6 +286,24 @@ async def scrape_bulk_concurrent(
     return results
 
 
+class DateAction(argparse.Action):
+    """Custom action to handle both --date and --dates arguments and store them in the same destination"""
+    
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, **kwargs)
+    
+    def __call__(self, parser, namespace, values, option_string=None):
+        # Initialize dates list if not already present
+        if getattr(namespace, self.dest, None) is None:
+            setattr(namespace, self.dest, [])
+        
+        # If value is a list (nargs='+' case), extend
+        if isinstance(values, list):
+            getattr(namespace, self.dest).extend(values)
+        else:
+            getattr(namespace, self.dest).append(values)
+        
+
 def main() -> None:
     """Main CLI entry point"""
     parser = argparse.ArgumentParser(
@@ -328,15 +346,18 @@ def main() -> None:
     search_group = parser.add_argument_group("Flight Search")
     search_group.add_argument("--origin", type=str, help="Origin airport code")
     search_group.add_argument("--destination", type=str, help="Destination airport code")
-    search_group.add_argument(
-        "--date", type=str, help="Departure date (YYYY-MM-DD)"
+    
+    # Add both --date and --dates aliases
+    date_group = search_group.add_mutually_exclusive_group()
+    date_group.add_argument(
+        "--date", "--dates",
+        dest="dates",
+        action=DateAction,
+        nargs='+',
+        help="Departure date(s) in format YYYY-MM-DD or date range YYYY-MM-DD:YYYY-MM-DD. "
+             "Can accept single date, multiple dates, or date ranges."
     )
-    search_group.add_argument(
-        "--dates", 
-        type=str, 
-        nargs="+", 
-        help="Departure dates (YYYY-MM-DD) or range (YYYY-MM-DD:YYYY-MM-DD) for bulk search"
-    )
+    
     search_group.add_argument(
         "--passengers", type=int, default=1, help="Number of passengers"
     )
@@ -402,7 +423,7 @@ def main() -> None:
     setup_logging(verbose=args.verbose, log_file=log_file)
 
     logger.info("=" * 60)
-    logger.info("AA Flight Scraper - Production Ready")
+    logger.info("AA Flight Scraper - Production Ready (v0.2.0)")
     logger.info("=" * 60)
 
     # Cookie file path
@@ -433,35 +454,29 @@ def main() -> None:
                 return
 
             # Process dates - can be a single date or multiple dates/ranges
-            if args.date and args.dates:
-                logger.error("Cannot specify both --date and --dates. Use --dates for all date inputs.")
+            if not args.dates:
+                logger.error("No dates specified. Use --date or --dates to specify date(s) or date range.")
                 sys.exit(1)
                 
-            if args.date:
-                # Single date mode (backwards compatibility)
-                dates = [args.date]
-            elif args.dates:
-                # Multiple dates mode - process each spec which can be a date or range
-                try:
-                    dates = parse_date_list(args.dates)
-                except ValueError as e:
-                    logger.error(f"Invalid date specification: {e}")
-                    sys.exit(1)
-            else:
-                dates = None
+            try:
+                dates = parse_date_list(args.dates)
+            except ValueError as e:
+                logger.error(f"Invalid date specification: {e}")
+                sys.exit(1)
 
             # Check if bulk mode
-            is_bulk_mode = bool(args.origins or args.destinations or (dates and len(dates) > 1))
+            origins = args.origins or ([args.origin] if args.origin else None)
+            destinations = args.destinations or ([args.destination] if args.destination else None)
+            
+            is_bulk_mode = bool(len(origins) > 1 if origins else False or 
+                              len(destinations) > 1 if destinations else False or 
+                              len(dates) > 1)
             
             if is_bulk_mode:
                 # Bulk mode validation
-                origins = args.origins or ([args.origin] if args.origin else None)
-                destinations = args.destinations or ([args.destination] if args.destination else None)
-                
                 if not all([origins, destinations, dates]):
                     logger.error(
-                        "Bulk mode requires at least one of: "
-                        "--origins, --destinations, --dates (or use --origin/--destination/--date)"
+                        "Please specify both origin(s) and destination(s) with date(s) or date range"
                     )
                     sys.exit(1)
                 
@@ -560,9 +575,9 @@ def main() -> None:
                 logger.info("=" * 80)
                 
             else:
-                # Original single-route mode
-                if not all([args.origin, args.destination, dates and len(dates) == 1]):
-                    logger.error("Missing required: --origin, --destination, --date")
+                # Single-route mode
+                if not all([origins and len(origins) == 1, destinations and len(destinations) == 1, dates and len(dates) == 1]):
+                    logger.error("Please specify exactly one origin, one destination, and one date.")
                     sys.exit(1)
 
                 # Extract cookies if requested
@@ -574,14 +589,16 @@ def main() -> None:
                     )
 
                 # Search flights
+                origin = origins[0]
+                destination = destinations[0]
                 date = dates[0]
                 logger.info(
-                    f"Searching flights: {args.origin} → {args.destination} on {date}"
+                    f"Searching flights: {origin} → {destination} on {date}"
                 )
 
                 results, raw_responses = await scrape_flights(
-                    origin=args.origin.upper(),
-                    destination=args.destination.upper(),
+                    origin=origin.upper(),
+                    destination=destination.upper(),
                     date=date,
                     passengers=args.passengers,
                     cookie_manager=cookie_manager,
@@ -601,8 +618,8 @@ def main() -> None:
                     results,
                     raw_responses,
                     output_dir,
-                    args.origin,
-                    args.destination,
+                    origin,
+                    destination,
                     date,
                     args.passengers,
                     args.cabin,
@@ -612,7 +629,7 @@ def main() -> None:
                 logger.info("")
                 logger.info("=" * 60)
                 logger.success("✓ Scraping complete!")
-                logger.info(f"  Route: {args.origin} → {args.destination}")
+                logger.info(f"  Route: {origin} → {destination}")
                 logger.info(f"  Date: {date}")
                 logger.info(f"  Cabin: {CABIN_CLASS_MAP.get(args.cabin, args.cabin.lower())}")
 
