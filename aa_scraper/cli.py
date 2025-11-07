@@ -1,8 +1,10 @@
-"""Command-line interface for the AA scraper"""
+"""Command-line interface for the AA scraper with async streaming storage"""
 
 import argparse
 import asyncio
+import gc
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from itertools import product
@@ -32,7 +34,7 @@ from .cookie_manager import CookieManager
 from .logging_config import setup_logging
 from .rate_limiter import AdaptiveRateLimiter
 from .parser import FlightDataParser
-from .storage import save_results
+from .storage import save_results_streaming
 from .date_utils import parse_date_list, validate_date_list, get_date_range_info
 
 
@@ -121,19 +123,17 @@ async def scrape_bulk_concurrent(
     destinations: List[str],
     dates: List[str],
     passengers: int,
-    cookie_manager: Optional[CookieManager] = None,  # Single browser (backwards compat)
-    cookie_pool: Optional[CookiePool] = None,         # Multi-browser (new)
+    cookie_manager: Optional[CookieManager] = None,
+    cookie_pool: Optional[CookiePool] = None,
     cabin_filter: str = "COACH",
     search_types: List[str] = ["Award", "Revenue"],
     rate_limit: float = DEFAULT_RATE_LIMIT,
     max_concurrent: int = 5,
-) -> List[Tuple[str, str, str, Dict, Dict]]:
+    output_dir: Path = Path("./output"),
+) -> Dict[str, Any]:
     """
-    Scrape multiple origin-destination-date combinations concurrently.
-    
-    Supports two modes:
-    1. Single browser (backwards compatible): Use cookie_manager
-    2. Multi-browser (new): Use cookie_pool with round-robin task assignment
+    Memory-efficient bulk scraping with streaming storage.
+    Saves each result immediately instead of accumulating in RAM.
     
     Args:
         origins: List of origin airport codes
@@ -146,9 +146,10 @@ async def scrape_bulk_concurrent(
         search_types: List of search types (Award, Revenue)
         rate_limit: Rate limit in requests per second
         max_concurrent: Max concurrent for single browser OR total for multi-browser
+        output_dir: Output directory for results
     
     Returns:
-        List of (origin, destination, date, results, raw_responses) tuples
+        Summary statistics dict
     """
     # Validate inputs
     if cookie_manager is None and cookie_pool is None:
@@ -161,18 +162,23 @@ async def scrape_bulk_concurrent(
     combinations = list(product(origins, destinations, dates))
     total = len(combinations)
     
+    # ✅ CREATE STORAGE ONCE (pre-create directories)
+    from .storage import AsyncStreamingStorage
+    global_storage = AsyncStreamingStorage(output_dir)
+    logger.info(f"💾 Pre-initialized storage: {output_dir}")
+
     # Determine mode
     using_pool = cookie_pool is not None
     
     logger.info("=" * 80)
     if using_pool:
-        logger.info(f"🚀 MULTI-BROWSER BULK CONCURRENT SCRAPING")
+        logger.info(f"🚀 MULTI-BROWSER BULK CONCURRENT SCRAPING (Memory-Efficient)")
         logger.info("=" * 80)
         logger.info(f"Browsers:      {cookie_pool.num_browsers}")
         logger.info(f"Per-browser:   {cookie_pool.max_concurrent_per_browser} concurrent")
         logger.info(f"Total max:     {cookie_pool.num_browsers * cookie_pool.max_concurrent_per_browser} concurrent")
     else:
-        logger.info(f"🚀 SINGLE-BROWSER BULK CONCURRENT SCRAPING")
+        logger.info(f"🚀 SINGLE-BROWSER BULK CONCURRENT SCRAPING (Memory-Efficient)")
         logger.info("=" * 80)
         logger.info(f"Max concurrent: {max_concurrent}")
     
@@ -184,7 +190,6 @@ async def scrape_bulk_concurrent(
     if consecutive_days > 0:
         logger.info(f"Date range:    {dates[0]} to {dates[-1]} ({total_dates} days)")
     else:
-        # More than 3 dates, summarize
         if total_dates > 3:
             logger.info(f"Dates:        {dates[0]}, {dates[1]}, {dates[2]} ... {dates[-1]} ({total_dates} total)")
         else:
@@ -192,20 +197,30 @@ async def scrape_bulk_concurrent(
     
     logger.info(f"Total combos:  {total}")
     logger.info(f"Search types:  {', '.join(search_types)}")
+    logger.info(f"💾 Streaming:   Results saved immediately to disk")
     logger.info("=" * 80)
     logger.info("")
     
     # Create appropriate semaphore
     if using_pool:
-        # No global semaphore - each browser has its own
         semaphore = None
     else:
-        # Single browser - use global semaphore
         semaphore = asyncio.Semaphore(max_concurrent)
     
-    async def scrape_single_combo(task_id: int, origin: str, dest: str, date: str):
-        """Scrape a single origin-destination-date combination"""
-        
+    # Track statistics
+    stats = {
+        'successful': 0,
+        'failed': 0,
+        'total_flights': 0,
+        'start_time': asyncio.get_event_loop().time(),
+    }
+    stats_lock = asyncio.Lock()
+    
+    async def scrape_and_save_single_combo(task_id: int, origin: str, dest: str, date: str):
+        """
+        Scrape a single combination and save immediately.
+        This function does NOT return large data - everything is streamed to disk.
+        """
         # Get cookie manager for this task
         if using_pool:
             browser = cookie_pool.get_browser(task_id)
@@ -217,12 +232,13 @@ async def scrape_bulk_concurrent(
             task_semaphore = semaphore
             browser_id = None
         
-        # Acquire semaphore
+        # Acquire semaphore ONLY for scraping
         async with task_semaphore:
             try:
                 browser_prefix = f"[Browser #{browser_id}] " if browser_id is not None else ""
                 logger.info(f"{browser_prefix}🔍 Starting: {origin} → {dest} on {date}")
                 
+                # Scrape flights
                 results, raw_responses = await scrape_flights(
                     origin=origin,
                     destination=dest,
@@ -234,25 +250,56 @@ async def scrape_bulk_concurrent(
                     rate_limit=rate_limit,
                 )
                 
-                # Count successful results
-                success_count = sum(1 for r in results.values() if r is not None)
-                total_flights = sum(len(r) for r in results.values() if r is not None)
-                
-                logger.success(
-                    f"{browser_prefix}✅ Completed: {origin} → {dest} on {date} "
-                    f"({success_count}/{len(search_types)} searches, {total_flights} flights)"
-                )
-                
-                return (origin, dest, date, results, raw_responses)
-                
             except Exception as e:
+                async with stats_lock:
+                    stats['failed'] += 1
+                
                 browser_prefix = f"[Browser #{browser_id}] " if browser_id is not None else ""
                 logger.error(f"{browser_prefix}❌ Failed: {origin} → {dest} on {date}: {e}")
-                return (origin, dest, date, None, None)
+                return False
+        
+        # ✅ SAVE OUTSIDE SEMAPHORE - Don't block other scrapers!
+        try:
+            output_file, num_flights = await save_results_streaming(
+                results,
+                raw_responses,
+                output_dir,
+                origin,
+                dest,
+                date,
+                passengers,
+                cabin_filter,
+            )
+            
+            # Clear memory
+            del results
+            del raw_responses
+            gc.collect()
+            
+            # Update stats
+            async with stats_lock:
+                stats['successful'] += 1
+                stats['total_flights'] += num_flights
+            
+            browser_prefix = f"[Browser #{browser_id}] " if browser_id is not None else ""
+            logger.success(
+                f"{browser_prefix}✅ Completed: {origin} → {dest} on {date} "
+                f"({len(search_types)} searches, {num_flights} flights saved)"
+            )
+            
+            return True
+            
+        except Exception as e:
+            async with stats_lock:
+                stats['failed'] += 1
+            
+            browser_prefix = f"[Browser #{browser_id}] " if browser_id is not None else ""
+            logger.error(f"{browser_prefix}❌ Save failed: {origin} → {dest} on {date}: {e}")
+            return False
     
     # Create tasks for all combinations
     tasks = [
-        scrape_single_combo(i, origin, dest, date)
+        scrape_and_save_single_combo(i, origin, dest, date)
         for i, (origin, dest, date) in enumerate(combinations)
     ]
     
@@ -263,35 +310,33 @@ async def scrape_bulk_concurrent(
         logger.info(f"⚡ Executing {total} combinations with max {max_concurrent} concurrent...")
     logger.info("")
     
-    start_time = asyncio.get_event_loop().time()
-    results = await asyncio.gather(*tasks, return_exceptions=False)
-    end_time = asyncio.get_event_loop().time()
+    # Execute with periodic progress logging
+    await asyncio.gather(*tasks, return_exceptions=False)
     
-    duration = end_time - start_time
+    end_time = asyncio.get_event_loop().time()
+    duration = end_time - stats['start_time']
     
     # Summary
-    successful = sum(1 for r in results if r[3] is not None)
-    failed = total - successful
-    
     logger.info("")
     logger.info("=" * 80)
-    logger.info("✅ BULK SCRAPING COMPLETE")
+    logger.success("✅ BULK SCRAPING COMPLETE")
     logger.info("=" * 80)
     logger.info(f"Total combinations: {total}")
-    logger.info(f"Successful:        {successful}")
-    logger.info(f"Failed:            {failed}")
+    logger.info(f"Successful:        {stats['successful']}")
+    logger.info(f"Failed:            {stats['failed']}")
+    logger.info(f"Total flights:     {stats['total_flights']}")
     logger.info(f"Duration:          {duration:.1f}s")
     logger.info(f"Avg per combo:     {duration/total:.1f}s")
     
     if using_pool:
-        logger.info(f"Effective rate:    {successful/duration:.1f} combos/sec")
+        logger.info(f"Effective rate:    {stats['successful']/duration:.1f} combos/sec")
         logger.info("")
         cookie_pool.print_stats()
     
     logger.info("=" * 80)
     logger.info("")
     
-    return results
+    return stats
 
 
 class DateAction(argparse.Action):
@@ -631,6 +676,7 @@ def main() -> None:
                         search_types=args.search_type,
                         rate_limit=args.rate_limit,
                         max_concurrent=args.max_concurrent,
+                        output_dir=Path(args.output),
                     )
                 else:
                     # Single browser mode with optional single proxy
@@ -687,36 +733,14 @@ def main() -> None:
                         search_types=args.search_type,
                         rate_limit=args.rate_limit,
                         max_concurrent=args.max_concurrent,
+                        output_dir=Path(args.output),
                     )
-                
-                # Save results (same for both modes)
-                output_dir = Path(args.output)
-                
-                successful_count = 0
-                for origin, dest, date, results, raw_responses in bulk_results:
-                    if results is None:
-                        continue
-                    
-                    try:
-                        save_results(
-                            results,
-                            raw_responses,
-                            output_dir,
-                            origin,
-                            dest,
-                            date,
-                            args.passengers,
-                            args.cabin,
-                        )
-                        successful_count += 1
-                    except Exception as e:
-                        logger.error(f"Failed to save {origin}→{dest} on {date}: {e}")
                 
                 # Final summary
                 logger.info("")
                 logger.info("=" * 80)
-                logger.success(f"✓ Bulk scraping complete! Saved {successful_count} result sets")
-                logger.info(f"  Output directory: {output_dir}")
+                logger.success(f"✓ Bulk scraping complete! Saved {bulk_results['total_flights']} flights")
+                logger.info(f"  Output directory: {args.output}")
                 if use_multi_browser:
                     logger.info(f"  Browsers used: {num_browsers}")
                     logger.info(f"  Per-browser concurrency: {args.max_concurrent}")
@@ -804,9 +828,9 @@ def main() -> None:
                     logger.error("All searches failed")
                     sys.exit(1)
 
-                # Save results
+                # Save results using async streaming storage
                 output_dir = Path(args.output)
-                save_results(
+                output_file, num_flights = await save_results_streaming(
                     results,
                     raw_responses,
                     output_dir,
@@ -817,6 +841,11 @@ def main() -> None:
                     args.cabin,
                 )
 
+                # Clear memory
+                del results
+                del raw_responses
+                gc.collect()
+
                 # Summary
                 logger.info("")
                 logger.info("=" * 60)
@@ -824,11 +853,7 @@ def main() -> None:
                 logger.info(f"  Route: {origin} → {destination}")
                 logger.info(f"  Date: {date}")
                 logger.info(f"  Cabin: {CABIN_CLASS_MAP.get(args.cabin, args.cabin.lower())}")
-
-                for search_type, result in results.items():
-                    if result:
-                        logger.info(f"  {search_type}: {len(result)} flights")
-
+                logger.info(f"  Flights saved: {num_flights}")
                 logger.info(f"  Output: {output_dir}")
                 if proxy_pool and single_proxy:
                     logger.info(f"  Proxy: {single_proxy.host}:{single_proxy.port}")
