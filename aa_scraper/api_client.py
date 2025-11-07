@@ -4,12 +4,19 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 import httpx
+import json
+import time
 from loguru import logger
 
 from .circuit_breaker import CircuitBreaker
 from .config import API_ENDPOINT, BASE_URL
 from .cookie_manager import CookieManager
-from .exceptions import CircuitOpenError, CookieExpiredError, RateLimitError
+from .exceptions import (
+    CircuitOpenError,
+    CookieExpiredError,
+    IPBlockedError,
+    RateLimitError,
+)
 from .rate_limiter import AdaptiveRateLimiter
 from .retry import retry_with_backoff
 
@@ -21,14 +28,14 @@ class AAFlightClient:
     - Circuit breaker pattern
     - Exponential backoff retry
     - Request health checks
-    - Persistent HTTP client connections
+    - Fresh HTTP client per request (prevents bot‑detection)
     """
 
     def __init__(
         self,
         cookie_manager: CookieManager,
         rate_limiter: AdaptiveRateLimiter,
-        timeout: float = 10.0,
+        timeout: float = 30.0,  # browser‑like timeout
     ):
         """
         Initialize API client.
@@ -43,43 +50,17 @@ class AAFlightClient:
         self.timeout = timeout
         self.circuit_breaker = CircuitBreaker(name="aa_api")
         self.session_start = datetime.now()
-        
-        # Create persistent HTTP clients (one for HTTP/2, one for HTTP/1.1)
-        limits = httpx.Limits(
-            max_keepalive_connections=20,
-            max_connections=50,
-            keepalive_expiry=60.0,
-        )
-        
-        self._client_http2 = httpx.AsyncClient(
-            timeout=self.timeout,
-            limits=limits,
-            http2=True,
-            follow_redirects=True,
-        )
-        
-        self._client_http1 = httpx.AsyncClient(
-            timeout=self.timeout,
-            limits=limits,
-            http2=False,
-            follow_redirects=True,
-        )
 
-        logger.info("Flight client initialized with auto-recovery and persistent connections")
+        logger.info("Flight client initialized with auto-recovery and per‑request clients")
 
-    async def close(self):
-        """Close HTTP clients and cleanup resources"""
-        await self._client_http2.aclose()
-        await self._client_http1.aclose()
-        logger.info("Flight client closed")
-
+    # ------------------------------------------------------------------ #
+    # Context‑manager helpers – nothing to clean up any more
     async def __aenter__(self):
-        """Async context manager entry"""
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
-        await self.close()
+        pass
+    # ------------------------------------------------------------------ #
 
     def _build_headers(
         self,
@@ -113,21 +94,21 @@ class AAFlightClient:
                     original_key, value = captured_lower[header_name]
                     headers[original_key] = value
 
-            # Add remaining headers
+            # Add any remaining headers that were not in the ordered list
             for key, value in captured_headers.items():
                 if key.lower() not in [h.lower() for h in headers.keys()]:
                     headers[key] = value
 
-            # Override referer
+            # Ensure the referer is what we want
             if referer:
-                for key in headers.keys():
+                for key in list(headers.keys()):
                     if key.lower() == "referer":
                         headers[key] = referer
                         break
                 else:
                     headers["Referer"] = referer
         else:
-            # Fallback headers
+            # Minimal fallback headers
             headers = {
                 "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0",
                 "Accept": "application/json, text/plain, */*",
@@ -141,7 +122,8 @@ class AAFlightClient:
             if referer:
                 headers["Referer"] = referer
 
-        # Ensure critical headers
+        # ------------------------------------------------------------------ #
+        # Critical headers that must be present – add them if missing
         headers_lower = {k.lower(): k for k in headers.keys()}
         if "x-xsrf-token" not in headers_lower and "XSRF-TOKEN" in cookies:
             headers["X-XSRF-TOKEN"] = cookies["XSRF-TOKEN"]
@@ -151,6 +133,7 @@ class AAFlightClient:
             headers[
                 "User-Agent"
             ] = "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0"
+        # ------------------------------------------------------------------ #
 
         return headers
 
@@ -216,104 +199,166 @@ class AAFlightClient:
         search_type: str,
         http_version: str = "HTTP/2",
     ) -> Dict[str, Any]:
-        """Make a single API request using persistent client"""
-        from .exceptions import IPBlockedError
-        
-        # Get fresh cookies
+        """Make a single API request (fresh client per call)"""
+        # -------------------------------------------------------------- #
+        # 1️⃣  Get fresh cookies / headers / referer
         cookies, captured_headers, referer = await self.cookie_manager.get_cookies()
         headers = self._build_headers(cookies, captured_headers, referer)
+
+        # 2️⃣  Build payload
         payload = self._build_request_payload(
             origin, destination, date, passengers, search_type
         )
 
-        # Acquire rate limit token
+        # 3️⃣  Log request meta‑data (helps debugging)
+        request_id = f"{origin}-{destination}-{date}-{search_type}"
+        logger.info(f"🔍 [{request_id}] Starting {search_type} search via {http_version}")
+        logger.debug(f"   Route: {origin} → {destination}")
+        logger.debug(f"   Date: {date}")
+        logger.debug(f"   Passengers: {passengers}")
+        logger.debug(f"   HTTP Version: {http_version}")
+
+        # 4️⃣  Acquire a token from the adaptive rate limiter
         await self.rate_limiter.acquire()
 
-        # Select appropriate persistent client
-        client = self._client_http2 if http_version == "HTTP/2" else self._client_http1
+        # 5️⃣  Choose HTTP/2 or HTTP/1.1
+        http2_enabled = http_version == "HTTP/2"
 
-        logger.info(
-            f"🔍 {search_type}: {origin} → {destination} on {date} (via {http_version})"
+        # 6️⃣  Use *conservative* connection limits – these are the same
+        #     numbers you used in the working Docker version.
+        limits = httpx.Limits(
+            max_keepalive_connections=5,
+            max_connections=10,
+            keepalive_expiry=30.0,
         )
 
-        # Make request with persistent client (pass cookies and headers per-request)
-        response = await client.post(
-            API_ENDPOINT,
-            json=payload,
-            headers=headers,
+        # -------------------------------------------------------------- #
+        # 7️⃣  Create a **fresh** AsyncClient for this single request.
+        async with httpx.AsyncClient(
             cookies=cookies,
-        )
-
-        logger.debug(f"Response: {response.status_code}")
-
-        # 🆕 CHECK FOR IP BLOCK IN RESPONSE
-        # If we got HTML instead of JSON, might be IP blocked
-        content_type = response.headers.get("content-type", "").lower()
-        
-        if "text/html" in content_type or response.status_code in [403, 451]:
-            # Response is HTML, not JSON - check for permission denied
+            headers=headers,
+            timeout=self.timeout,
+            limits=limits,
+            http2=http2_enabled,
+            follow_redirects=True,
+        ) as client:
+            start_time = time.time()
             try:
-                html_content = response.text
-                if self._detect_permission_denied_in_response(html_content):
-                    logger.error("🚫 IP BLOCKED - Server returned 'Permission Denied' page")
-                    logger.error("   This is a server-level IP block, not an Akamai challenge")
-                    logger.error("   The IP address is temporarily blocked (~20 min)")
-                    logger.error("   Recommended wait: ~40 minutes before retrying")
-                    raise IPBlockedError(
-                        "Server blocked IP with 'Permission Denied'. "
-                        "Wait ~40 minutes before retrying."
-                    )
-            except IPBlockedError:
+                response = await client.post(API_ENDPOINT, json=payload)
+                request_duration = time.time() - start_time
+                logger.debug(
+                    f"   ← Response {response.status_code} ({request_duration:.2f}s)"
+                )
+                logger.debug(
+                    f"   ← Content-Type: {response.headers.get('content-type', 'unknown')}"
+                )
+            except httpx.TimeoutException as e:
+                logger.error(f"❌ [{request_id}] REQUEST TIMEOUT")
+                logger.error(f"   Error: {e}")
                 raise
-            except:
-                pass  # Not HTML or couldn't parse, continue with normal error handling
+            except httpx.ConnectError as e:
+                logger.error(f"❌ [{request_id}] CONNECTION FAILED")
+                logger.error(f"   Error: {e}")
+                raise
+            except httpx.HTTPError as e:
+                logger.error(f"❌ [{request_id}] HTTP ERROR")
+                logger.error(f"   Error: {e}")
+                raise
 
-        # Handle specific status codes (existing code)
+        # -------------------------------------------------------------- #
+        # 8️⃣  Handle special status codes / HTML blocks
+        content_type = response.headers.get("content-type", "").lower()
+
+        if "text/html" in content_type or response.status_code in {403, 451}:
+            logger.warning(
+                f"⚠️ [{request_id}] Unexpected HTML response (possible block)"
+            )
+            logger.warning(f"   Status: {response.status_code}")
+            logger.warning(f"   Content-Type: {content_type}")
+
+            html = response.text
+            if self._detect_permission_denied_in_response(html):
+                logger.error(f"🚫 [{request_id}] IP BLOCKED - Permission Denied")
+                raise IPBlockedError(
+                    "Server blocked IP with 'Permission Denied'. "
+                    "Wait ~40 minutes before retrying."
+                )
+            else:
+                # If we got HTML but not a clear block, raise a generic error
+                raise httpx.HTTPStatusError(
+                    f"Unexpected HTML response (status {response.status_code})",
+                    request=response.request,
+                    response=response,
+                )
+
         if response.status_code == 403:
-            logger.warning("Got 403 - bot detection triggered")
-            raise CookieExpiredError("403 Forbidden - cookies may be invalid")
+            logger.error(f"❌ [{request_id}] 403 FORBIDDEN – likely cookie / bot issue")
+            raise CookieExpiredError("403 Forbidden – cookies may be invalid")
 
         if response.status_code == 429:
-            retry_after = int(response.headers.get("Retry-After", 60))
-            logger.warning(f"Rate limited - retry after {retry_after}s")
+            retry_after = int(response.headers.get("Retry-After", "60"))
+            logger.error(
+                f"⏰ [{request_id}] 429 RATE LIMITED – retry after {retry_after}s"
+            )
             await self.rate_limiter.backoff(retry_after)
             raise RateLimitError(f"Rate limited, retry after {retry_after}s")
 
-        response.raise_for_status()
+        if response.status_code >= 400:
+            logger.error(f"❌ [{request_id}] HTTP {response.status_code} ERROR")
+            response.raise_for_status()
 
-        # Success - recover rate limiter
+        # -------------------------------------------------------------- #
+        # 9️⃣  Parse JSON – raise if malformed
+        try:
+            data = response.json()
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ [{request_id}] INVALID JSON RESPONSE")
+            logger.error(f"   Error: {e}")
+            raise
+
+        # 10️⃣  Verify expected structure
+        if "slices" not in data:
+            logger.error(f"❌ [{request_id}] MISSING 'slices' in API response")
+            raise ValueError("API response missing 'slices' field")
+
+        slices = data.get("slices", [])
+        logger.success(
+            f"✅ [{request_id}] {search_type} search successful ({request_duration:.2f}s)"
+        )
+        logger.info(f"   Slices Received: {len(slices)}")
+        if slices:
+            first = slices[0]
+            logger.debug(
+                f"   First Slice – stops: {first.get('stops')}, "
+                f"duration: {first.get('durationInMinutes')}min, "
+                f"segments: {len(first.get('segments', []))}"
+            )
+
+        # 11️⃣  Tell the rate limiter we finished successfully
         await self.rate_limiter.recover()
 
-        return response.json()
-    
+        return data
+
+    # ------------------------------------------------------------------ #
+    # Helper to detect Akamai / generic Access‑Denied pages
     def _detect_permission_denied_in_response(self, response_text: str) -> bool:
         """
         Detect if API response contains Access Denied / Permission Denied page.
-        
         Matches the actual Akamai Access Denied HTML structure.
-        
-        Args:
-            response_text: Response body text
-            
-        Returns:
-            True if access denied detected
         """
         text_lower = response_text.lower()
-        
-        # Primary patterns (Akamai Access Denied - actual page structure)
+
+        # Primary patterns (Akamai Access Denied – actual page structure)
         akamai_patterns = [
             "<title>access denied</title>",
             "<h1>access denied</h1>",
             "you don't have permission to access",
-            "you don't have permission to access",  # Alternative apostrophe
             "errors.edgesuite.net",
         ]
-        
-        # Require at least 2 Akamai patterns for confidence
-        akamai_matches = sum(1 for pattern in akamai_patterns if pattern in text_lower)
+        akamai_matches = sum(1 for pat in akamai_patterns if pat in text_lower)
         if akamai_matches >= 2:
             return True
-        
+
         # Secondary patterns (other block types)
         other_patterns = [
             "permission denied",
@@ -323,14 +368,14 @@ class AAFlightClient:
             "<title>forbidden</title>",
             "<title>403",
         ]
-        
-        # Check for reference number (Akamai block indicator)
+
+        # Reference number sometimes appears on Akamai blocks
         has_reference = "reference" in text_lower and (
-            "reference&#32;&#35;" in text_lower or 
-            "reference #" in text_lower
+            "reference&#32;&#35;" in text_lower or "reference #" in text_lower
         )
-        
-        return any(pattern in text_lower for pattern in other_patterns) or has_reference
+
+        return any(p in text_lower for p in other_patterns) or has_reference
+    # ------------------------------------------------------------------ #
 
     async def search_flights(
         self,
@@ -343,7 +388,7 @@ class AAFlightClient:
         """
         Search for flights with automatic recovery.
         Tries HTTP/2, falls back to HTTP/1.1.
-        Auto-refreshes cookies on 403 errors.
+        Auto‑refreshes cookies on 403 errors.
         """
 
         async def attempt_search():
@@ -351,48 +396,47 @@ class AAFlightClient:
             for http_version in ["HTTP/2", "HTTP/1.1"]:
                 try:
                     return await self._make_request(
-                        origin, destination, date, passengers, search_type, http_version
+                        origin,
+                        destination,
+                        date,
+                        passengers,
+                        search_type,
+                        http_version,
                     )
                 except (httpx.StreamError, httpx.HTTPStatusError) as e:
                     if http_version == "HTTP/2":
                         logger.warning(f"HTTP/2 failed, trying HTTP/1.1: {e}")
                         continue
                     raise
-
             return None
 
         async def on_retry_callback(attempt: int, error: Exception):
-            """Handle retry attempts"""
+            """Handle retry attempts (refresh cookies, back‑off, etc.)"""
             from .retry import classify_error
             from .models import ErrorType
-            
+
             error_type = classify_error(error)
 
             if error_type == ErrorType.AUTH_FAILURE:
-                logger.warning("Auth failure detected - refreshing cookies...")
+                logger.warning("Auth failure detected – refreshing cookies...")
                 try:
-                    await self.cookie_manager.get_cookies(
-                        force_refresh=True, headless=True
-                    )
+                    await self.cookie_manager.get_cookies(force_refresh=True, headless=True)
                     logger.success("✓ Cookies refreshed")
                 except Exception as e:
                     logger.error(f"Failed to refresh cookies: {e}")
 
             elif error_type == ErrorType.RATE_LIMIT:
-                logger.warning("Rate limit detected - increasing backoff...")
+                logger.warning("Rate limit detected – increasing backoff...")
                 await self.rate_limiter.backoff(30)
 
         try:
-            # Use circuit breaker for protection
             result = await self.circuit_breaker.call(
                 retry_with_backoff,
                 attempt_search,
                 on_retry=on_retry_callback,
             )
-
             if result:
                 logger.success(f"✅ {search_type} search successful")
-
             return result
 
         except CircuitOpenError as e:
