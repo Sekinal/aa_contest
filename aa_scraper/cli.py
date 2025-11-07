@@ -37,6 +37,23 @@ from .parser import FlightDataParser
 from .storage import save_results_streaming
 from .date_utils import parse_date_list, validate_date_list, get_date_range_info
 
+_FILE_IO_SEMAPHORE = None
+# Global rate limiter shared across all combos
+_SHARED_RATE_LIMITER = None
+
+def _get_shared_rate_limiter(rate: float, burst: int):
+    """Get or create the global shared rate limiter"""
+    global _SHARED_RATE_LIMITER
+    if _SHARED_RATE_LIMITER is None:
+        _SHARED_RATE_LIMITER = AdaptiveRateLimiter(rate=rate, burst=burst)
+    return _SHARED_RATE_LIMITER
+
+def _get_file_io_semaphore(max_concurrent_writes: int = 3):
+    """Get or create the global file I/O semaphore"""
+    global _FILE_IO_SEMAPHORE
+    if _FILE_IO_SEMAPHORE is None:
+        _FILE_IO_SEMAPHORE = asyncio.Semaphore(max_concurrent_writes)
+    return _FILE_IO_SEMAPHORE
 
 async def scrape_flights(
     origin: str,
@@ -134,7 +151,7 @@ async def scrape_flights_with_metrics(
     rate_limit: float = DEFAULT_RATE_LIMIT,
 ) -> Tuple[Dict, Dict, Dict]:
     """
-    Scrape flights with metrics tracking.
+    Scrape flights with metrics tracking - CONCURRENT execution of Award/Revenue.
     
     Args:
         origin: Origin airport code
@@ -164,58 +181,68 @@ async def scrape_flights_with_metrics(
         results = {}
         raw_responses = {}
         
+        # 🔥 CREATE CONCURRENT TASKS (instead of sequential loop)
+        tasks = []
         for search_type in search_types:
+            task = client.search_flights(
+                origin, destination, date, passengers, search_type
+            )
+            tasks.append((search_type, task))
+        
+        # 🚀 EXECUTE ALL SEARCHES CONCURRENTLY
+        import time
+        start_time = time.time()
+        
+        responses = await asyncio.gather(
+            *[task for _, task in tasks], 
+            return_exceptions=True
+        )
+        
+        elapsed = time.time() - start_time
+        
+        # Process results
+        for (search_type, _), api_response in zip(tasks, responses):
             metrics['api_requests'] += 1
             
-            # Track time ourselves
-            import time
-            start_time = time.time()
+            # Track response time (divided by number of concurrent requests for average)
+            metrics['response_times'].append(elapsed / len(search_types))
             
-            try:
-                # Make request - returns API response dict (not tuple!)
-                api_response = await client.search_flights(
-                    origin, destination, date, passengers, search_type
-                )
-                
-                # Track response time
-                elapsed = time.time() - start_time
-                metrics['response_times'].append(elapsed)
-                
-                raw_responses[search_type] = api_response
-                
-                # Count response bytes
-                if api_response:
-                    import json
-                    response_json = json.dumps(api_response)
-                    metrics['responses_bytes'] += len(response_json.encode())
-                
-                if not api_response:
-                    logger.warning(f"{search_type} search returned no data")
-                    results[search_type] = None
-                    continue
-                
-                # Parse flights
-                try:
-                    flights = FlightDataParser.parse_flight_options(
-                        api_response, cabin_filter=cabin_filter, search_type=search_type
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to parse {search_type} flights: {e}")
-                    results[search_type] = None
-                    continue
-                
-                if not flights:
-                    logger.warning(f"No {cabin_filter} flights found in {search_type} response")
-                    results[search_type] = None
-                    continue
-                
-                logger.success(f"Found {len(flights)} {search_type} flights")
-                results[search_type] = flights
-            
-            except Exception as e:
-                logger.error(f"{search_type} search failed: {e}")
+            if isinstance(api_response, Exception):
+                logger.error(f"{search_type} search failed with exception: {api_response}")
                 results[search_type] = None
                 raw_responses[search_type] = None
+                continue
+            
+            raw_responses[search_type] = api_response
+            
+            # Count response bytes
+            if api_response:
+                import json
+                response_json = json.dumps(api_response)
+                metrics['responses_bytes'] += len(response_json.encode())
+            
+            if not api_response:
+                logger.warning(f"{search_type} search returned no data")
+                results[search_type] = None
+                continue
+            
+            # Parse flights
+            try:
+                flights = FlightDataParser.parse_flight_options(
+                    api_response, cabin_filter=cabin_filter, search_type=search_type
+                )
+            except Exception as e:
+                logger.warning(f"Failed to parse {search_type} flights: {e}")
+                results[search_type] = None
+                continue
+            
+            if not flights:
+                logger.warning(f"No {cabin_filter} flights found in {search_type} response")
+                results[search_type] = None
+                continue
+            
+            logger.success(f"Found {len(flights)} {search_type} flights")
+            results[search_type] = flights
     
     return results, raw_responses, metrics
 
@@ -342,6 +369,9 @@ async def scrape_bulk_concurrent(
             task_semaphore = semaphore
             browser_id = None
         
+        # 🔥 GET FILE I/O SEMAPHORE (global limit on disk writes)
+        file_io_semaphore = _get_file_io_semaphore(max_concurrent_writes=3)
+        
         # Acquire semaphore ONLY for scraping
         async with task_semaphore:
             try:
@@ -381,51 +411,52 @@ async def scrape_bulk_concurrent(
                 logger.error(f"{browser_prefix}❌ Failed: {origin} → {dest} on {date}: {e}")
                 return False
         
-        # ✅ SAVE OUTSIDE SEMAPHORE - Don't block other scrapers!
-        try:
-            save_start = asyncio.get_event_loop().time()
-            
-            output_file, num_flights, saved_bytes = await save_results_streaming(
-                results,
-                raw_responses,
-                output_dir,
-                origin,
-                dest,
-                date,
-                passengers,
-                cabin_filter,
-            )
-            
-            save_duration = asyncio.get_event_loop().time() - save_start
-            
-            # Clear memory
-            del results
-            del raw_responses
-            gc.collect()
-            
-            # Update stats
-            async with stats_lock:
-                stats['successful'] += 1
-                stats['total_flights'] += num_flights
-                stats['total_saved_bytes'] += saved_bytes
-            
-            # Log completion with timing info
-            browser_prefix = f"[Browser #{browser_id}] " if browser_id is not None else ""
-            logger.success(
-                f"{browser_prefix}✅ Completed: {origin} → {dest} on {date} "
-                f"({len(search_types)} searches, {num_flights} flights saved) "
-                f"API: {combo_duration:.2f}s, Save: {save_duration:.2f}s"
-            )
-            
-            return True
-            
-        except Exception as e:
-            async with stats_lock:
-                stats['failed'] += 1
-            
-            browser_prefix = f"[Browser #{browser_id}] " if browser_id is not None else ""
-            logger.error(f"{browser_prefix}❌ Save failed: {origin} → {dest} on {date}: {e}")
-            return False
+        # ✅ SAVE WITH FILE I/O SEMAPHORE - Throttle concurrent disk writes!
+        async with file_io_semaphore:
+            try:
+                save_start = asyncio.get_event_loop().time()
+                
+                output_file, num_flights, saved_bytes = await save_results_streaming(
+                    results,
+                    raw_responses,
+                    output_dir,
+                    origin,
+                    dest,
+                    date,
+                    passengers,
+                    cabin_filter,
+                )
+                
+                save_duration = asyncio.get_event_loop().time() - save_start
+                
+                # Clear memory
+                del results
+                del raw_responses
+                gc.collect()
+                
+                # Update stats
+                async with stats_lock:
+                    stats['successful'] += 1
+                    stats['total_flights'] += num_flights
+                    stats['total_saved_bytes'] += saved_bytes
+                
+                # Log completion with timing info
+                browser_prefix = f"[Browser #{browser_id}] " if browser_id is not None else ""
+                logger.success(
+                    f"{browser_prefix}✅ Completed: {origin} → {dest} on {date} "
+                    f"({len(search_types)} searches, {num_flights} flights saved) "
+                    f"API: {combo_duration:.2f}s, Save: {save_duration:.2f}s"
+                )
+                
+                return True
+                
+            except Exception as e:
+                async with stats_lock:
+                    stats['failed'] += 1
+                
+                browser_prefix = f"[Browser #{browser_id}] " if browser_id is not None else ""
+                logger.error(f"{browser_prefix}❌ Save failed: {origin} → {dest} on {date}: {e}")
+                return False
     
     # Create tasks for all combinations
     tasks = [
