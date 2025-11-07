@@ -1,5 +1,4 @@
-"""
-American Airlines Flight Scraper
+"""American Airlines Flight Scraper
 Production-ready async scraper with advanced bot evasion
 """
 
@@ -18,6 +17,7 @@ from .models import CircuitState, ErrorType
 from .parser import FlightDataParser
 from .rate_limiter import AdaptiveRateLimiter
 from .cookie_pool import CookiePool
+from .date_utils import parse_date_list, parse_date_or_range, validate_date_list
 
 __all__ = [
     "__version__",
@@ -33,4 +33,7 @@ __all__ = [
     "ErrorType",
     "FlightDataParser",
     "AdaptiveRateLimiter",
+    "parse_date_list",
+    "parse_date_or_range",
+    "validate_date_list",
 ]

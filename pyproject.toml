@@ -8,6 +8,7 @@ dependencies = [
     "camoufox>=0.4.11",
     "httpx[http2]>=0.28.1",
     "loguru>=0.7.3",
+    "python-dateutil>=2.9.0.post0",
     "tqdm>=4.67.1",
     "uuid>=1.30",
 ]
