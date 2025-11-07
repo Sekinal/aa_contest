@@ -518,6 +518,7 @@ def main() -> None:
                     
                 except Exception as e:
                     # Handle IP blocking
+                    from .exceptions import IPBlockedError
                     
                     if isinstance(e, IPBlockedError) and proxy_pool and single_proxy:
                         logger.error("Proxy got IP blocked during cookie extraction!")
@@ -667,6 +668,7 @@ def main() -> None:
                                 
                         except Exception as e:
                             # Handle IP blocking
+                            from .exceptions import IPBlockedError
                             
                             if isinstance(e, IPBlockedError) and proxy_pool and single_proxy:
                                 logger.error("Proxy got IP blocked during cookie extraction!")
@@ -764,6 +766,7 @@ def main() -> None:
                             
                     except Exception as e:
                         # Handle IP blocking
+                        from .exceptions import IPBlockedError
                         
                         if isinstance(e, IPBlockedError) and proxy_pool and single_proxy:
                             logger.error("Proxy got IP blocked during cookie extraction!")
