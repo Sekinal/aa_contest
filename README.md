@@ -40,7 +40,7 @@ docker run --rm \
   --origins LAX SFO \
   --destinations JFK MIA ORD DFW \
   --dates 2025-12-15 2025-12-16 2025-12-17 \
-  --max-concurrent 10
+  --max-concurrent 5
 ```
 
 **This creates 2 × 4 × 3 = 24 route/date combinations that run concurrently!** 🚀
@@ -151,9 +151,23 @@ docker run --rm \
   --origins LAX SFO SEA \
   --destinations JFK BOS PHL DCA \
   --dates 2025-12-15 2025-12-20 2025-12-25 \
-  --max-concurrent 15
+  --max-concurrent 5
 ```
 
+I recommend that instead of increasing the concurrency, you instead increase the number of cookies extracted, simulating the requests of three different browsers! Much safer from my tests and less likely to get blocked, whilst still achieving high net concurrency.
+
+```
+docker run --rm \
+  -v "$(pwd)/cookies:/app/cookies" \
+  -v "$(pwd)/output:/app/output" \
+  -v "$(pwd)/logs:/app/logs" \
+  thermostatic/aa-scraper:latest \
+  --origins LAX SFO SEA \
+  --destinations JFK BOS PHL DCA \
+  --dates 2025-12-15 2025-12-20 2025-12-25 \
+  --max-concurrent 5 \
+  --browsers 3
+```
 **This creates 3 × 4 × 3 = 36 combinations!**
 
 #### Performance Tuning
@@ -167,15 +181,15 @@ docker run --rm \
   --origins LAX SFO \
   --destinations JFK MIA ORD \
   --dates 2025-12-15 2025-12-16 \
-  --max-concurrent 10 \
-  --rate-limit 2.0 \
+  --max-concurrent 5 \
   --verbose
 ```
 
 **Performance recommendations:**
-- **Conservative**: `--max-concurrent 5` + `--rate-limit 1.0` (safe, slower)
-- **Balanced**: `--max-concurrent 10` + `--rate-limit 2.0` (recommended)
-- **Aggressive**: `--max-concurrent 15` + `--rate-limit 3.0` (fast, watch for 429s)
+- **Safest**: `--max-concurrent 5` (This is the default option, totally safe)
+- **Conservative**: `--max-concurrent 5` + `--browsers 3` (pretty safe, haven't tested scraping continuously for more than 5 minutes though)
+- **Balanced**: `--max-concurrent 10` + `--browsers 3` (risky, likely to get blocked after a few minutes)
+- **Aggressive**: `--max-concurrent 15` + `--browsers 3` (fast, will likely be blocked if scraping for more than 1 minute)
 
 ### Advanced Options
 
@@ -312,16 +326,356 @@ The `*_combined.json` file contains merged Award + Revenue data:
       "is_nonstop": true,
       "segments": [
         {
-          "flight_number": "AA123",
-          "departure_time": "08:00",
-          "arrival_time": "16:30"
+          "flight_number": "AA28",
+          "departure_time": "00:15",
+          "arrival_time": "08:29"
         }
       ],
-      "total_duration": "5h 30m",
-      "points_required": 12500,
-      "cash_price_usd": 350.50,
-      "taxes_fees_usd": 45.60,
-      "cpp": 2.44
+      "total_duration": "5h 14m",
+      "points_required": 18000,
+      "cash_price_usd": 208.48,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.13
+    },
+    {
+      "is_nonstop": true,
+      "segments": [
+        {
+          "flight_number": "AA118",
+          "departure_time": "06:05",
+          "arrival_time": "14:10"
+        }
+      ],
+      "total_duration": "5h 5m",
+      "points_required": 15000,
+      "cash_price_usd": 208.48,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.35
+    },
+    {
+      "is_nonstop": true,
+      "segments": [
+        {
+          "flight_number": "AA2",
+          "departure_time": "07:00",
+          "arrival_time": "15:32"
+        }
+      ],
+      "total_duration": "5h 32m",
+      "points_required": 17500,
+      "cash_price_usd": 208.48,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.16
+    },
+    {
+      "is_nonstop": true,
+      "segments": [
+        {
+          "flight_number": "AA307",
+          "departure_time": "08:00",
+          "arrival_time": "16:28"
+        }
+      ],
+      "total_duration": "5h 28m",
+      "points_required": 20000,
+      "cash_price_usd": 258.49,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.26
+    },
+    {
+      "is_nonstop": true,
+      "segments": [
+        {
+          "flight_number": "AA238",
+          "departure_time": "10:15",
+          "arrival_time": "18:42"
+        }
+      ],
+      "total_duration": "5h 27m",
+      "points_required": 31000,
+      "cash_price_usd": 368.48,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.17
+    },
+    {
+      "is_nonstop": true,
+      "segments": [
+        {
+          "flight_number": "AA32",
+          "departure_time": "11:20",
+          "arrival_time": "19:45"
+        }
+      ],
+      "total_duration": "5h 25m",
+      "points_required": 27000,
+      "cash_price_usd": 298.49,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.08
+    },
+    {
+      "is_nonstop": true,
+      "segments": [
+        {
+          "flight_number": "AA274",
+          "departure_time": "12:37",
+          "arrival_time": "21:00"
+        }
+      ],
+      "total_duration": "5h 23m",
+      "points_required": 27500,
+      "cash_price_usd": 368.48,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.32
+    },
+    {
+      "is_nonstop": true,
+      "segments": [
+        {
+          "flight_number": "AA4",
+          "departure_time": "15:40",
+          "arrival_time": "23:49"
+        }
+      ],
+      "total_duration": "5h 9m",
+      "points_required": 15000,
+      "cash_price_usd": 143.48,
+      "taxes_fees_usd": 5.6,
+      "cpp": 0.92
+    },
+    {
+      "is_nonstop": true,
+      "segments": [
+        {
+          "flight_number": "AA10",
+          "departure_time": "21:45",
+          "arrival_time": "06:00"
+        }
+      ],
+      "total_duration": "5h 15m",
+      "points_required": 20000,
+      "cash_price_usd": 258.49,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.26
+    },
+    {
+      "is_nonstop": false,
+      "segments": [
+        {
+          "flight_number": "AA1956",
+          "departure_time": "00:45",
+          "arrival_time": "06:46"
+        },
+        {
+          "flight_number": "AA2848",
+          "departure_time": "08:20",
+          "arrival_time": "11:37"
+        }
+      ],
+      "total_duration": "7h 52m",
+      "points_required": 15000,
+      "cash_price_usd": 226.19,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.47
+    },
+    {
+      "is_nonstop": false,
+      "segments": [
+        {
+          "flight_number": "AA1956",
+          "departure_time": "00:45",
+          "arrival_time": "06:46"
+        },
+        {
+          "flight_number": "AA961",
+          "departure_time": "10:06",
+          "arrival_time": "13:29"
+        }
+      ],
+      "total_duration": "9h 44m",
+      "points_required": 15000,
+      "cash_price_usd": 226.19,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.47
+    },
+    {
+      "is_nonstop": false,
+      "segments": [
+        {
+          "flight_number": "AA2808",
+          "departure_time": "06:06",
+          "arrival_time": "13:46"
+        },
+        {
+          "flight_number": "AA3190",
+          "departure_time": "17:05",
+          "arrival_time": "19:00"
+        }
+      ],
+      "total_duration": "9h 54m",
+      "points_required": 15000,
+      "cash_price_usd": 226.19,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.47
+    },
+    {
+      "is_nonstop": false,
+      "segments": [
+        {
+          "flight_number": "AA2068",
+          "departure_time": "06:08",
+          "arrival_time": "11:19"
+        },
+        {
+          "flight_number": "AA1654",
+          "departure_time": "12:39",
+          "arrival_time": "17:15"
+        }
+      ],
+      "total_duration": "8h 7m",
+      "points_required": 15000,
+      "cash_price_usd": 226.19,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.47
+    },
+    {
+      "is_nonstop": false,
+      "segments": [
+        {
+          "flight_number": "AA2497",
+          "departure_time": "07:59",
+          "arrival_time": "15:55"
+        },
+        {
+          "flight_number": "AA4781",
+          "departure_time": "17:54",
+          "arrival_time": "19:17"
+        }
+      ],
+      "total_duration": "8h 18m",
+      "points_required": 15000,
+      "cash_price_usd": 226.19,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.47
+    },
+    {
+      "is_nonstop": false,
+      "segments": [
+        {
+          "flight_number": "AA3176",
+          "departure_time": "18:50",
+          "arrival_time": "20:23"
+        },
+        {
+          "flight_number": "AA276",
+          "departure_time": "22:37",
+          "arrival_time": "07:00"
+        }
+      ],
+      "total_duration": "9h 10m",
+      "points_required": 15000,
+      "cash_price_usd": 226.19,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.47
+    },
+    {
+      "is_nonstop": false,
+      "segments": [
+        {
+          "flight_number": "AA6260",
+          "departure_time": "20:00",
+          "arrival_time": "21:30"
+        },
+        {
+          "flight_number": "AA276",
+          "departure_time": "22:37",
+          "arrival_time": "07:00"
+        }
+      ],
+      "total_duration": "8h 0m",
+      "points_required": 19000,
+      "cash_price_usd": 233.18,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.2
+    },
+    {
+      "is_nonstop": false,
+      "segments": [
+        {
+          "flight_number": "AA820",
+          "departure_time": "22:37",
+          "arrival_time": "06:12"
+        },
+        {
+          "flight_number": "AA3199",
+          "departure_time": "08:09",
+          "arrival_time": "10:00"
+        }
+      ],
+      "total_duration": "8h 23m",
+      "points_required": 15000,
+      "cash_price_usd": 226.19,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.47
+    },
+    {
+      "is_nonstop": false,
+      "segments": [
+        {
+          "flight_number": "AA2715",
+          "departure_time": "23:59",
+          "arrival_time": "04:58"
+        },
+        {
+          "flight_number": "AA1554",
+          "departure_time": "07:01",
+          "arrival_time": "11:28"
+        }
+      ],
+      "total_duration": "8h 29m",
+      "points_required": 15000,
+      "cash_price_usd": 226.19,
+      "taxes_fees_usd": 5.6,
+      "cpp": 1.47
+    },
+    {
+      "is_nonstop": false,
+      "segments": [
+        {
+          "flight_number": "AA6371",
+          "departure_time": "17:03",
+          "arrival_time": "18:30"
+        },
+        {
+          "flight_number": "AA276",
+          "departure_time": "22:37",
+          "arrival_time": "07:00"
+        }
+      ],
+      "total_duration": "10h 57m",
+      "points_required": 20500,
+      "cash_price_usd": 327.97,
+      "taxes_fees_usd": 11.2,
+      "cpp": 1.55
+    },
+    {
+      "is_nonstop": false,
+      "segments": [
+        {
+          "flight_number": "AA2453",
+          "departure_time": "22:49",
+          "arrival_time": "07:14"
+        },
+        {
+          "flight_number": "AA4721",
+          "departure_time": "12:03",
+          "arrival_time": "13:29"
+        }
+      ],
+      "total_duration": "11h 40m",
+      "points_required": 15000,
+      "cash_price_usd": 231.97,
+      "taxes_fees_usd": 11.2,
+      "cpp": 1.47
     }
   ],
   "total_results": 20
@@ -373,7 +727,7 @@ uv run -m aa_scraper \
   --origins LAX SFO \
   --destinations JFK MIA ORD \
   --dates 2025-12-15 2025-12-16 \
-  --max-concurrent 10
+  --max-concurrent 5
 ```
 
 ### Development Commands
@@ -732,7 +1086,7 @@ docker run --rm \
   --origins LAX SFO \
   --destinations JFK MIA ORD \
   --dates 2025-12-15 2025-12-20 2025-12-25 \
-  --max-concurrent 10
+  --max-concurrent 5
 
 # Find best CPP values
 grep -r "cpp" output/*_combined.json | \
@@ -840,7 +1194,7 @@ docker run --rm \
   --origins LAX SFO \
   --destinations JFK MIA ORD \
   --dates 2025-12-15 2025-12-16 \
-  --max-concurrent 10
+  --max-concurrent 5
 ```
 
 **Local (uv) - Single Route**
@@ -855,7 +1209,7 @@ uv run -m aa_scraper \
   --origins LAX SFO \
   --destinations JFK MIA ORD \
   --dates 2025-12-15 2025-12-16 \
-  --max-concurrent 10
+  --max-concurrent 5
 ```
 
 **Docker Hub**
