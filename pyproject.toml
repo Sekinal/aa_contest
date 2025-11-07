@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "camoufox",
+    "camoufox>=0.4.11",
     "curl-cffi>=0.13.0",
     "httpx[http2]>=0.28.1",
     "loguru>=0.7.3",
@@ -21,6 +21,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["aa_scraper"]
-
-[tool.uv.sources]
-camoufox = { git = "https://github.com/coryking/camoufox.git", subdirectory = "pythonlib", rev = "v142.0.1-fork.27" }
