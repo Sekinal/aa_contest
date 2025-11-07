@@ -20,6 +20,13 @@ from .config import (
     DEFAULT_TEST_DESTINATION,
     DEFAULT_TEST_ORIGIN,
 )
+from .exceptions import (
+    AAScraperError,
+    CircuitOpenError,
+    CookieExpiredError,
+    RateLimitError,
+    IPBlockedError,
+)
 from .cookie_manager import CookieManager
 from .logging_config import setup_logging
 from .rate_limiter import AdaptiveRateLimiter
@@ -640,6 +647,39 @@ def main() -> None:
                 logger.info(f"  Output: {output_dir}")
                 logger.info("=" * 60)
 
+        except IPBlockedError as e:
+            # 🆕 HANDLE IP BLOCKING WITH CLEAR GUIDANCE
+            logger.error("")
+            logger.error("=" * 80)
+            logger.error("🚫 IP ADDRESS BLOCKED BY SERVER")
+            logger.error("=" * 80)
+            logger.error("")
+            logger.error("❌ Your IP address has been blocked by the server.")
+            logger.error("   This is a SERVER-LEVEL block, not an Akamai challenge.")
+            logger.error("")
+            logger.error("📋 Details:")
+            logger.error(f"   {str(e)}")
+            logger.error("")
+            logger.error("⏰ TIMING RECOMMENDATIONS:")
+            logger.error("   • Minimum wait: ~20 minutes")
+            logger.error("   • Recommended wait: ~40 minutes (safer)")
+            logger.error("   • Warning: Retrying at ~20 minutes may cause instant re-blocking")
+            logger.error("")
+            logger.error("💡 WHAT TO DO:")
+            logger.error("   1. Wait at least 40 minutes before retrying")
+            logger.error("   2. Consider using a different IP address or proxy")
+            logger.error("   3. Reduce scraping aggressiveness when you retry")
+            logger.error("   4. Check if you have other processes hitting the same site")
+            logger.error("")
+            logger.error("🔍 TROUBLESHOOTING:")
+            logger.error("   • Review your recent request patterns")
+            logger.error("   • Ensure you're not making too many concurrent requests")
+            logger.error("   • Verify your rate limits are appropriately configured")
+            logger.error("   • Consider using --rate-limit 0.5 or lower")
+            logger.error("")
+            logger.error("=" * 80)
+            sys.exit(2)  # Different exit code for IP blocking
+            
         except KeyboardInterrupt:
             logger.warning("Interrupted by user")
             sys.exit(1)

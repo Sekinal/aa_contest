@@ -217,6 +217,8 @@ class AAFlightClient:
         http_version: str = "HTTP/2",
     ) -> Dict[str, Any]:
         """Make a single API request using persistent client"""
+        from .exceptions import IPBlockedError
+        
         # Get fresh cookies
         cookies, captured_headers, referer = await self.cookie_manager.get_cookies()
         headers = self._build_headers(cookies, captured_headers, referer)
@@ -244,7 +246,29 @@ class AAFlightClient:
 
         logger.debug(f"Response: {response.status_code}")
 
-        # Handle specific status codes
+        # 🆕 CHECK FOR IP BLOCK IN RESPONSE
+        # If we got HTML instead of JSON, might be IP blocked
+        content_type = response.headers.get("content-type", "").lower()
+        
+        if "text/html" in content_type or response.status_code in [403, 451]:
+            # Response is HTML, not JSON - check for permission denied
+            try:
+                html_content = response.text
+                if self._detect_permission_denied_in_response(html_content):
+                    logger.error("🚫 IP BLOCKED - Server returned 'Permission Denied' page")
+                    logger.error("   This is a server-level IP block, not an Akamai challenge")
+                    logger.error("   The IP address is temporarily blocked (~20 min)")
+                    logger.error("   Recommended wait: ~40 minutes before retrying")
+                    raise IPBlockedError(
+                        "Server blocked IP with 'Permission Denied'. "
+                        "Wait ~40 minutes before retrying."
+                    )
+            except IPBlockedError:
+                raise
+            except:
+                pass  # Not HTML or couldn't parse, continue with normal error handling
+
+        # Handle specific status codes (existing code)
         if response.status_code == 403:
             logger.warning("Got 403 - bot detection triggered")
             raise CookieExpiredError("403 Forbidden - cookies may be invalid")
@@ -261,6 +285,52 @@ class AAFlightClient:
         await self.rate_limiter.recover()
 
         return response.json()
+    
+    def _detect_permission_denied_in_response(self, response_text: str) -> bool:
+        """
+        Detect if API response contains Access Denied / Permission Denied page.
+        
+        Matches the actual Akamai Access Denied HTML structure.
+        
+        Args:
+            response_text: Response body text
+            
+        Returns:
+            True if access denied detected
+        """
+        text_lower = response_text.lower()
+        
+        # Primary patterns (Akamai Access Denied - actual page structure)
+        akamai_patterns = [
+            "<title>access denied</title>",
+            "<h1>access denied</h1>",
+            "you don't have permission to access",
+            "you don't have permission to access",  # Alternative apostrophe
+            "errors.edgesuite.net",
+        ]
+        
+        # Require at least 2 Akamai patterns for confidence
+        akamai_matches = sum(1 for pattern in akamai_patterns if pattern in text_lower)
+        if akamai_matches >= 2:
+            return True
+        
+        # Secondary patterns (other block types)
+        other_patterns = [
+            "permission denied",
+            "your ip has been blocked",
+            "ip address blocked",
+            "temporarily blocked",
+            "<title>forbidden</title>",
+            "<title>403",
+        ]
+        
+        # Check for reference number (Akamai block indicator)
+        has_reference = "reference" in text_lower and (
+            "reference&#32;&#35;" in text_lower or 
+            "reference #" in text_lower
+        )
+        
+        return any(pattern in text_lower for pattern in other_patterns) or has_reference
 
     async def search_flights(
         self,

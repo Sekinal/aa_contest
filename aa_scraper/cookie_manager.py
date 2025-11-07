@@ -13,8 +13,7 @@ from .config import (
     COOKIE_MAX_AGE,
     COOKIE_WARNING_AGE,
 )
-from .exceptions import CookieExpiredError
-
+from .exceptions import CookieExpiredError, IPBlockedError
 
 class CookieManager:
     """
@@ -322,6 +321,22 @@ class CookieManager:
                 await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(2000)
 
+                # 🆕 CHECK FOR IP BLOCK AFTER HOMEPAGE LOAD
+                current_url = page.url
+                page_content = await page.content()
+                
+                is_blocked, block_type = self._detect_permission_denied(current_url, page_content)
+                if is_blocked:
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    logger.error(f"🚫 IP BLOCKED detected on homepage! ({block_type})")
+                    logger.error(f"   The server has blocked this IP address")
+                    logger.error(f"   This is NOT an Akamai challenge - it's a server-level block")
+                    await page.screenshot(path="error_ip_blocked_homepage.png")
+                    raise IPBlockedError(
+                        f"IP blocked by server (detected: {block_type}). "
+                        f"Wait ~40 minutes before retrying."
+                    )
+
                 cookie_accepted = await self._accept_cookie_consent(page)
                 if cookie_accepted:
                     logger.success("   ✅ Cookie consent accepted on homepage!")
@@ -343,6 +358,26 @@ class CookieManager:
 
                             if status == 200:
                                 try:
+                                    # 🆕 CHECK IF RESPONSE IS ACTUALLY HTML (IP BLOCKED)
+                                    content_type = response.headers.get("content-type", "").lower()
+                                    
+                                    # If we got HTML instead of JSON, might be IP blocked
+                                    if "text/html" in content_type:
+                                        try:
+                                            html_content = await response.text()
+                                            is_blocked, block_type = self._detect_permission_denied(
+                                                response.url, html_content
+                                            )
+                                            if is_blocked:
+                                                logger.error(
+                                                    f"🚫 API returned HTML with IP block ({block_type})"
+                                                )
+                                                raise IPBlockedError(
+                                                    f"API response indicates IP blocked ({block_type})"
+                                                )
+                                        except json.JSONDecodeError:
+                                            pass  # Let normal JSON handling deal with it
+                                    
                                     data = await response.json()
 
                                     # Validate response
@@ -402,18 +437,47 @@ class CookieManager:
                 elapsed = (datetime.now() - start_time).total_seconds()
                 logger.info(f"   Search page loaded in {elapsed:.1f}s")
 
-                # STEP 4: Detect and handle Akamai challenge
+                # 🆕 CHECK FOR IP BLOCK AFTER SEARCH PAGE LOAD
                 current_url = page.url
                 page_content = await page.content()
-
-                is_akamai, challenge_type = self._detect_akamai_challenge(
-                    current_url, page_content
-                )
-
-                if is_akamai:
+                
+                is_blocked, block_type = self._detect_permission_denied(current_url, page_content)
+                if is_blocked:
                     elapsed = (datetime.now() - start_time).total_seconds()
-                    logger.warning(f"🛡️ Akamai challenge detected! ({challenge_type})")
-                    logger.info("   Waiting for challenge to complete...")
+                    logger.error(f"🚫 IP BLOCKED detected on search page! ({block_type})")
+                    logger.error(f"   The server has blocked this IP address")
+                    logger.error(f"   This is NOT an Akamai challenge - it's a server-level block")
+                    logger.error(f"   Recommended wait: ~40 minutes (minimum: ~20 minutes)")
+                    await page.screenshot(path="error_ip_blocked_search.png")
+                    raise IPBlockedError(
+                        f"IP blocked by server (detected: {block_type}). "
+                        f"Wait ~40 minutes before retrying."
+                    )
+
+                # STEP 4: Detect and handle Akamai challenge vs hard block
+                current_url = page.url
+                page_content = await page.content()
+                
+                # First check for hard IP block (Access Denied)
+                is_blocked, block_type = self._detect_permission_denied(current_url, page_content)
+                
+                if is_blocked:
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    logger.error(f"🚫 ACCESS DENIED - Hard IP block detected! ({block_type})")
+                    logger.error(f"   This is an Akamai hard block, not a solvable challenge")
+                    logger.error(f"   The IP address has been blocked by the server")
+                    logger.error(f"   Recommended wait: ~40 minutes (minimum: ~20 minutes)")
+                    await page.screenshot(path="error_access_denied_block.png")
+                    raise IPBlockedError(
+                        f"Akamai hard block - Access Denied (type: {block_type}). "
+                        f"Wait ~40 minutes before retrying."
+                    )
+                
+                # Now check for SOLVABLE Akamai challenge
+                if self._is_solvable_challenge(current_url, page_content):
+                    elapsed = (datetime.now() - start_time).total_seconds()
+                    logger.warning(f"🛡️ Akamai solvable challenge detected!")
+                    logger.info("   This is a solvable challenge, waiting for completion...")
 
                     try:
                         await page.wait_for_function(
@@ -421,6 +485,16 @@ class CookieManager:
                             () => {
                                 const url = window.location.href;
                                 const content = document.body.innerHTML;
+                                
+                                // Check if we're still on challenge or access denied page
+                                const isStillBlocked = content.toLowerCase().includes('access denied') ||
+                                                       content.toLowerCase().includes('you don\\'t have permission');
+                                
+                                if (isStillBlocked) {
+                                    return false;  // Still blocked
+                                }
+                                
+                                // Check if challenge is resolved
                                 return !url.includes('akamai') && 
                                     !url.includes('challenge') &&
                                     !content.includes('sec_chlge_form') &&
@@ -432,18 +506,49 @@ class CookieManager:
                             timeout=90000,
                         )
 
+                        # Double-check we didn't end up on Access Denied
+                        final_content = await page.content()
+                        final_is_blocked, final_block_type = self._detect_permission_denied(
+                            page.url, final_content
+                        )
+                        
+                        if final_is_blocked:
+                            logger.error(f"🚫 Challenge 'solved' but landed on Access Denied page")
+                            await page.screenshot(path="error_challenge_to_block.png")
+                            raise IPBlockedError(
+                                f"Challenge led to Access Denied - IP is blocked ({final_block_type})"
+                            )
+
                         total_elapsed = (datetime.now() - start_time).total_seconds()
                         logger.success(f"✓ Akamai challenge passed! ({total_elapsed:.1f}s)")
 
+                    except asyncio.TimeoutError:
+                        # Check if timeout was due to hard block
+                        timeout_content = await page.content()
+                        timeout_blocked, timeout_type = self._detect_permission_denied(
+                            page.url, timeout_content
+                        )
+                        
+                        if timeout_blocked:
+                            logger.error(f"🚫 Challenge timeout - Actually an Access Denied page")
+                            await page.screenshot(path="error_timeout_was_block.png")
+                            raise IPBlockedError(
+                                f"Akamai challenge was actually a hard block ({timeout_type})"
+                            )
+                        else:
+                            logger.error(f"❌ Akamai challenge timeout: {e}")
+                            await page.screenshot(path="error_akamai_timeout.png")
+                            raise CookieExpiredError("Akamai challenge failed")
+                    
                     except Exception as e:
-                        logger.error(f"❌ Akamai challenge timeout: {e}")
-                        await page.screenshot(path="error_akamai_timeout.png")
-                        raise CookieExpiredError("Akamai challenge failed")
+                        logger.error(f"❌ Akamai challenge error: {e}")
+                        await page.screenshot(path="error_akamai_failed.png")
+                        raise CookieExpiredError(f"Akamai challenge failed: {e}")
                 else:
                     elapsed = (datetime.now() - start_time).total_seconds()
-                    logger.success(f"✓ No Akamai challenge ({elapsed:.1f}s)")
+                    logger.success(f"✓ No Akamai challenge or block ({elapsed:.1f}s)")
 
-                # STEP 5: Wait for API request with valid response
+                # STEP 5: Wait for API request with valid response (existing code continues...)
                 logger.info("Step 4/5: Waiting for VALID API response...")
 
                 max_wait = wait_time
@@ -470,7 +575,7 @@ class CookieManager:
                         await page.screenshot(path="error_no_valid_api.png")
                         raise CookieExpiredError("Valid API response not received")
 
-                # STEP 6: Extract cookies
+                # STEP 6: Extract cookies (existing code continues...)
                 logger.info("Step 5/5: Extracting validated cookies...")
 
                 final_url = page.url
@@ -485,7 +590,7 @@ class CookieManager:
                 # Validate cookies
                 self._validate_extracted_cookies(captured_cookies)
 
-            # Final validation
+            # Final validation (existing code continues...)
             if not api_request_completed or not api_response_data:
                 raise CookieExpiredError("API request did not complete successfully")
 
@@ -509,6 +614,9 @@ class CookieManager:
             logger.info("   • API validated: ✓")
             logger.info(f"   • Slices: {len(slices)}")
 
+        except IPBlockedError:
+            # Re-raise IP blocked errors without wrapping
+            raise
         except Exception as e:
             logger.error(f"Cookie extraction failed: {e}")
             raise CookieExpiredError(f"Failed to extract cookies: {e}")
@@ -572,6 +680,134 @@ class CookieManager:
 
         return False, "none"
 
+    def _detect_permission_denied(self, url: str, page_content: str) -> Tuple[bool, str]:
+        """
+        Detect if page shows Access Denied / Permission Denied (IP blocked).
+        
+        This detects Akamai hard blocks and server-level IP blocks.
+        Different from solvable Akamai challenges.
+        
+        Returns:
+            (is_blocked, block_type)
+        """
+        content_lower = page_content.lower()
+        url_lower = url.lower()
+        
+        # PRIMARY DETECTION: Akamai Access Denied page
+        # This is the most common IP block page from AA.com
+        akamai_access_denied_patterns = [
+            # Exact HTML structure from actual block page
+            "<title>access denied</title>",
+            "<h1>access denied</h1>",
+            # Content patterns
+            "you don't have permission to access",
+            "you don't have permission to access",  # Handle both apostrophe types
+            "errors.edgesuite.net",  # Akamai error page URL
+        ]
+        
+        # Check for Akamai Access Denied (requires multiple matches for confidence)
+        akamai_matches = sum(1 for pattern in akamai_access_denied_patterns if pattern in content_lower)
+        if akamai_matches >= 2:  # At least 2 patterns must match
+            return True, "akamai_access_denied"
+        
+        # SECONDARY DETECTION: Other permission denied patterns
+        # Check page title first (most reliable)
+        title_patterns = {
+            "access_denied_title": "<title>access denied</title>",
+            "permission_denied_title": "<title>permission denied</title>",
+            "forbidden_title": "<title>403 forbidden</title>",
+            "blocked_title": "<title>blocked</title>",
+        }
+        
+        for block_type, pattern in title_patterns.items():
+            if pattern in content_lower:
+                return True, block_type
+        
+        # Check URL patterns (reliable indicators)
+        url_block_patterns = {
+            "permission_denied_path": "/permission_denied",
+            "access_denied_path": "/access_denied",
+            "forbidden_path": "/forbidden",
+            "blocked_path": "/blocked",
+        }
+        
+        for block_type, pattern in url_block_patterns.items():
+            if pattern in url_lower:
+                return True, block_type
+        
+        # Check body content patterns (less reliable, need strong signals)
+        content_block_patterns = {
+            "ip_blocked_explicit": "your ip has been blocked",
+            "ip_address_blocked": "ip address blocked",
+            "ip_temporarily_blocked": "ip temporarily blocked",
+            "temporarily_blocked": "temporarily blocked",
+        }
+        
+        for block_type, pattern in content_block_patterns.items():
+            if pattern in content_lower:
+                return True, block_type
+        
+        # Check for Reference # pattern (Akamai block indicator)
+        if "reference" in content_lower and ("&#46;" in page_content or "." in page_content):
+            # Look for reference number pattern like "Reference #18.4d2f7bd.1762483229.74ebcabb"
+            if "reference&#32;&#35;" in content_lower or "reference #" in content_lower:
+                return True, "akamai_reference_block"
+        
+        return False, "none"
+
+    def _is_solvable_challenge(self, url: str, page_content: str) -> bool:
+        """
+        Check if this is a SOLVABLE Akamai challenge (not a hard block).
+        
+        Solvable challenges have:
+        - Challenge forms (sec_chlge_form)
+        - JavaScript crypto providers
+        - Challenge resubmit mechanisms
+        
+        Hard blocks have:
+        - "Access Denied" title
+        - "You don't have permission" message
+        - No challenge forms
+        
+        Returns:
+            True if this is a solvable challenge (should wait)
+            False if this is a hard block (should terminate)
+        """
+        content_lower = page_content.lower()
+        
+        # Solvable challenge indicators
+        solvable_indicators = [
+            "sec_chlge_form",
+            "cp_clge_done",
+            'provider="crypto"',
+            "akamai-challenge-resubmit",
+            'class="sec-container"',
+        ]
+        
+        # Check if any solvable indicators present
+        has_solvable_indicators = any(
+            indicator in page_content for indicator in solvable_indicators
+        )
+        
+        # Hard block indicators (these override solvable indicators)
+        hard_block_indicators = [
+            "<title>access denied</title>",
+            "<h1>access denied</h1>",
+            "you don't have permission to access",
+            "errors.edgesuite.net",
+        ]
+        
+        has_hard_block = any(
+            indicator in content_lower for indicator in hard_block_indicators
+        )
+        
+        # If hard block indicators present, it's NOT solvable
+        if has_hard_block:
+            return False
+        
+        # If solvable indicators present and no hard block, it's solvable
+        return has_solvable_indicators
+    
     def _validate_extracted_cookies(self, cookies: Dict[str, str]) -> None:
         """Validate that we captured essential cookies"""
         # Critical cookies (must have)
