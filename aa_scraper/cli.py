@@ -831,9 +831,7 @@ def main() -> None:
             origins = args.origins or ([args.origin] if args.origin else None)
             destinations = args.destinations or ([args.destination] if args.destination else None)
             
-            is_bulk_mode = bool(len(origins) > 1 if origins else False or 
-                              len(destinations) > 1 if destinations else False or 
-                              len(dates) > 1)
+            is_bulk_mode = (origins and len(origins) > 1) or (destinations and len(destinations) > 1) or len(dates) > 1
             
             if is_bulk_mode:
                 # Bulk mode validation
