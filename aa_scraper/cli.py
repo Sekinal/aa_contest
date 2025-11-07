@@ -159,23 +159,27 @@ async def scrape_flights_with_metrics(
         'response_times': [],
         'cookie_refreshes': 0,
     }
-    
+
     async with AAFlightClient(cookie_manager, rate_limiter, timeout=DEFAULT_REQUEST_TIMEOUT) as client:
         results = {}
         raw_responses = {}
         
         for search_type in search_types:
+            metrics['api_requests'] += 1
+            
+            # Track time ourselves
+            import time
+            start_time = time.time()
+            
             try:
-                metrics['api_requests'] += 1
-                
-                # Track cookie refreshes
-                if hasattr(cookie_manager, 'consecutive_failures'):
-                    old_failures = cookie_manager.consecutive_failures
-                
-                # Make request and get metrics
+                # Make request - returns API response dict (not tuple!)
                 api_response = await client.search_flights(
                     origin, destination, date, passengers, search_type
                 )
+                
+                # Track response time
+                elapsed = time.time() - start_time
+                metrics['response_times'].append(elapsed)
                 
                 raw_responses[search_type] = api_response
                 
@@ -184,11 +188,6 @@ async def scrape_flights_with_metrics(
                     import json
                     response_json = json.dumps(api_response)
                     metrics['responses_bytes'] += len(response_json.encode())
-                
-                # Check if cookies were refreshed
-                if hasattr(cookie_manager, 'consecutive_failures'):
-                    if cookie_manager.consecutive_failures == 0 and old_failures > 0:
-                        metrics['cookie_refreshes'] += 1
                 
                 if not api_response:
                     logger.warning(f"{search_type} search returned no data")
@@ -217,10 +216,6 @@ async def scrape_flights_with_metrics(
                 logger.error(f"{search_type} search failed: {e}")
                 results[search_type] = None
                 raw_responses[search_type] = None
-                
-                # Track retry attempts
-                if hasattr(cookie_manager, 'consecutive_failures'):
-                    metrics['retries'] += cookie_manager.consecutive_failures
     
     return results, raw_responses, metrics
 
@@ -491,7 +486,8 @@ async def scrape_bulk_concurrent(
     logger.info(f"   Total duration:        {duration:.1f}s")
     logger.info(f"   Avg per combo:         {duration/total:.2f}s")
     logger.info(f"   Requests/second:       {req_per_sec:.2f} req/s")
-    logger.info(f"   Avg response time:     {avg_response_time*1000:.0f}ms")
+    if avg_response_time > 0:
+        logger.info(f"   Avg response time:     {avg_response_time*1000:.0f}ms")
     logger.info(f"   Cookie refreshes:      {stats['cookie_refreshes']}")
     logger.info(f"   Failed retries:        {stats['failed_retries']}")
     logger.info("")
@@ -501,7 +497,8 @@ async def scrape_bulk_concurrent(
     logger.info(f"   Data saved to disk:    {format_bytes(stats['total_saved_bytes'])}")
     logger.info(f"   Compression ratio:     {compression_ratio:.1f}%")
     if stats['total_api_requests'] > 0:
-        logger.info(f"   Avg per request:       {format_bytes(stats['total_responses_bytes'] / req_per_sec) if req_per_sec > 0 else 'N/A'}")
+        avg_per_req = stats['total_responses_bytes'] / stats['total_api_requests']
+        logger.info(f"   Avg per request:       {format_bytes(avg_per_req)}")
     
     if using_pool:
         logger.info("")

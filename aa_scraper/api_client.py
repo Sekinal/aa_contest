@@ -310,13 +310,7 @@ class AAFlightClient:
         # Tell rate limiter we finished successfully
         await self.rate_limiter.recover()
 
-        metrics = {
-            'response_time': request_duration,
-            'response_bytes': response_size,
-            'status_code': response.status_code,
-        }
-        
-        return data, metrics
+        return data
 
     def _detect_permission_denied_in_response(self, response_text: str) -> bool:
         """
