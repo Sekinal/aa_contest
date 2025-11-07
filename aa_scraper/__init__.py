@@ -1,10 +1,4 @@
-from .exceptions import (
-    AAScraperError,
-    CircuitOpenError,
-    CookieExpiredError,
-    RateLimitError,
-    IPBlockedError,
-)
+from .proxy_pool import ProxyPool, ProxyConfig
 
 __all__ = [
     "__version__",
@@ -12,6 +6,8 @@ __all__ = [
     "CircuitBreaker",
     "CookieManager",
     "CookiePool",
+    "ProxyPool",
+    "ProxyConfig",
     "AAScraperError",
     "CircuitOpenError",
     "CookieExpiredError",

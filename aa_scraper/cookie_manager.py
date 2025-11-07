@@ -28,6 +28,7 @@ class CookieManager:
         test_origin: str = "SRQ",
         test_destination: str = "BFL",
         test_days_ahead: int = 7,
+        proxy: Optional["ProxyConfig"] = None,
     ):
         """
         Initialize cookie manager.
@@ -37,11 +38,13 @@ class CookieManager:
             test_origin: Airport code for cookie validation
             test_destination: Airport code for cookie validation
             test_days_ahead: Days ahead for test date
+            proxy: Optional proxy configuration
         """
         self.cookie_file = cookie_file
         self.test_origin = test_origin
         self.test_destination = test_destination
         self.test_days_ahead = test_days_ahead
+        self.proxy = proxy
 
         self.cookies: Dict[str, str] = {}
         self.headers: Dict[str, str] = {}
@@ -53,7 +56,8 @@ class CookieManager:
         self.consecutive_failures = 0
         self.last_failure_time: Optional[datetime] = None
 
-        logger.info(f"Cookie manager initialized: {cookie_file}")
+        proxy_info = f" via proxy {proxy.host}:{proxy.port}" if proxy else ""
+        logger.info(f"Cookie manager initialized: {cookie_file}{proxy_info}")
 
     def _get_cookie_age(self) -> Optional[float]:
         """Get age of cookies in seconds"""
@@ -271,7 +275,8 @@ class CookieManager:
         from camoufox.async_api import AsyncCamoufox
         import urllib.parse
 
-        logger.info(f"🦊 Extracting cookies: {self.test_origin} → {self.test_destination}")
+        proxy_info = f" via {self.proxy.host}:{self.proxy.port}" if self.proxy else ""
+        logger.info(f"🦊 Extracting cookies{proxy_info}: {self.test_origin} → {self.test_destination}")
 
         # Build departure date
         departure_date = (
@@ -312,6 +317,14 @@ class CookieManager:
         api_request_completed = False
 
         try:
+            browser_config = {
+                "headless": headless,
+            }
+            
+            if self.proxy:
+                browser_config["proxy"] = self.proxy.to_playwright_dict()
+                logger.debug(f"   Using proxy: {self.proxy.host}:{self.proxy.port}")
+
             async with AsyncCamoufox(headless=headless) as browser:
                 page = await browser.new_page()
                 start_time = datetime.now()
@@ -321,7 +334,7 @@ class CookieManager:
                 await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(2000)
 
-                # 🆕 CHECK FOR IP BLOCK AFTER HOMEPAGE LOAD
+                # CHECK FOR IP BLOCK AFTER HOMEPAGE LOAD
                 current_url = page.url
                 page_content = await page.content()
                 
@@ -358,7 +371,7 @@ class CookieManager:
 
                             if status == 200:
                                 try:
-                                    # 🆕 CHECK IF RESPONSE IS ACTUALLY HTML (IP BLOCKED)
+                                    # CHECK IF RESPONSE IS ACTUALLY HTML (IP BLOCKED)
                                     content_type = response.headers.get("content-type", "").lower()
                                     
                                     # If we got HTML instead of JSON, might be IP blocked
@@ -437,7 +450,7 @@ class CookieManager:
                 elapsed = (datetime.now() - start_time).total_seconds()
                 logger.info(f"   Search page loaded in {elapsed:.1f}s")
 
-                # 🆕 CHECK FOR IP BLOCK AFTER SEARCH PAGE LOAD
+                # CHECK FOR IP BLOCK AFTER SEARCH PAGE LOAD
                 current_url = page.url
                 page_content = await page.content()
                 

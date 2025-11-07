@@ -27,6 +27,7 @@ from .exceptions import (
     RateLimitError,
     IPBlockedError,
 )
+from .proxy_pool import ProxyPool
 from .cookie_manager import CookieManager
 from .logging_config import setup_logging
 from .rate_limiter import AdaptiveRateLimiter
@@ -349,6 +350,20 @@ def main() -> None:
         help="Test date offset",
     )
 
+    # Proxy configuration
+    proxy_group = parser.add_argument_group("Proxy Configuration")
+    proxy_group.add_argument(
+        "--proxy-file",
+        type=str,
+        help="Path to proxy file (format: host:port:username:password per line)"
+    )
+    proxy_group.add_argument(
+        "--proxy-cooldown",
+        type=int,
+        default=40,
+        help="Minutes to wait after proxy IP block (default: 40)"
+    )
+
     # Flight search
     search_group = parser.add_argument_group("Flight Search")
     search_group.add_argument("--origin", type=str, help="Origin airport code")
@@ -452,13 +467,85 @@ def main() -> None:
                     logger.error("--cookies-only requires --extract-cookies")
                     sys.exit(1)
 
-                await cookie_manager.get_cookies(
-                    force_refresh=True,
-                    headless=not args.no_headless,
-                    wait_time=args.cookie_wait_time,
+                # Initialize proxy pool if proxy file provided
+                proxy_pool = None
+                if args.proxy_file:
+                    proxy_file = Path(args.proxy_file)
+                    if not proxy_file.exists():
+                        logger.error(f"Proxy file not found: {proxy_file}")
+                        sys.exit(1)
+                    
+                    try:
+                        proxy_pool = ProxyPool(
+                            proxy_file=proxy_file,
+                            cooldown_minutes=args.proxy_cooldown,
+                            max_browsers_per_proxy=3,
+                        )
+                        logger.info(f"✅ Loaded {len(proxy_pool.proxies)} proxies from {proxy_file}")
+                    except Exception as e:
+                        logger.error(f"Failed to load proxies: {e}")
+                        sys.exit(1)
+                
+                # Get single proxy if using proxies
+                single_proxy = None
+                if proxy_pool:
+                    single_proxy = await proxy_pool.get_available_proxy()
+                    if single_proxy:
+                        logger.info(f"Using proxy: {single_proxy.host}:{single_proxy.port}")
+                
+                # Create cookie manager with optional proxy
+                cookie_manager = CookieManager(
+                    cookie_file=cookie_file,
+                    test_origin=args.test_origin,
+                    test_destination=args.test_destination,
+                    test_days_ahead=args.test_days_ahead,
+                    proxy=single_proxy,
                 )
-                logger.success("Cookie extraction complete!")
-                return
+                
+                try:
+                    await cookie_manager.get_cookies(
+                        force_refresh=True,
+                        headless=not args.no_headless,
+                        wait_time=args.cookie_wait_time,
+                    )
+                    
+                    # Mark proxy success if using
+                    if proxy_pool and single_proxy:
+                        await proxy_pool.mark_proxy_success(single_proxy)
+                        
+                    logger.success("Cookie extraction complete!")
+                    return
+                    
+                except Exception as e:
+                    # Handle IP blocking
+                    from .exceptions import IPBlockedError
+                    
+                    if isinstance(e, IPBlockedError) and proxy_pool and single_proxy:
+                        logger.error("Proxy got IP blocked during cookie extraction!")
+                        await proxy_pool.mark_proxy_blocked(single_proxy)
+                    elif proxy_pool and single_proxy:
+                        await proxy_pool.mark_proxy_failure(single_proxy)
+                    
+                    raise
+
+            # Initialize proxy pool if proxy file provided
+            proxy_pool = None
+            if args.proxy_file:
+                proxy_file = Path(args.proxy_file)
+                if not proxy_file.exists():
+                    logger.error(f"Proxy file not found: {proxy_file}")
+                    sys.exit(1)
+                
+                try:
+                    proxy_pool = ProxyPool(
+                        proxy_file=proxy_file,
+                        cooldown_minutes=args.proxy_cooldown,
+                        max_browsers_per_proxy=3,
+                    )
+                    logger.info(f"✅ Loaded {len(proxy_pool.proxies)} proxies from {proxy_file}")
+                except Exception as e:
+                    logger.error(f"Failed to load proxies: {e}")
+                    sys.exit(1)
 
             # Process dates - can be a single date or multiple dates/ranges
             if not args.dates:
@@ -487,21 +574,44 @@ def main() -> None:
                     )
                     sys.exit(1)
                 
-                # Determine if we need multi-browser mode
-                use_multi_browser = args.browsers > 1
+                # Determine browser count based on proxies
+                if proxy_pool:
+                    # With proxies: one browser can be up to 3 browsers per proxy
+                    max_possible_browsers = len(proxy_pool.proxies) * 3
+                    requested_browsers = args.browsers
+                    
+                    if requested_browsers > max_possible_browsers:
+                        logger.warning(
+                            f"Requested {requested_browsers} browsers but only "
+                            f"{max_possible_browsers} supported by {len(proxy_pool.proxies)} proxies"
+                        )
+                        logger.warning(f"Adjusting to {max_possible_browsers} browsers")
+                        num_browsers = max_possible_browsers
+                    else:
+                        num_browsers = requested_browsers
+                    
+                    use_multi_browser = num_browsers > 1
+                else:
+                    # Without proxies: use requested browser count
+                    use_multi_browser = args.browsers > 1
+                    num_browsers = args.browsers if use_multi_browser else 1
                 
                 if use_multi_browser:
-                    logger.info(f"🍪 Multi-browser mode: {args.browsers} browsers")
+                    if proxy_pool:
+                        logger.info(f"🍪 Multi-browser mode with proxy rotation: {num_browsers} browsers across {len(proxy_pool.proxies)} proxies")
+                    else:
+                        logger.info(f"🍪 Multi-browser mode: {num_browsers} browsers")
                     
-                    # Create cookie pool
+                    # Create cookie pool with proxy support
                     cookie_dir = Path("./cookies")
                     cookie_pool = CookiePool(
-                        num_browsers=args.browsers,
+                        num_browsers=num_browsers,
                         base_cookie_dir=cookie_dir,
                         max_concurrent_per_browser=args.max_concurrent,
                         test_origin=args.test_origin,
                         test_destination=args.test_destination,
                         test_days_ahead=args.test_days_ahead,
+                        proxy_pool=proxy_pool,
                     )
                     
                     # Initialize all browser cookies
@@ -517,37 +627,71 @@ def main() -> None:
                         destinations=[d.upper() for d in destinations],
                         dates=dates,
                         passengers=args.passengers,
-                        cookie_pool=cookie_pool,  # Multi-browser mode
+                        cookie_pool=cookie_pool,
                         cabin_filter=args.cabin,
                         search_types=args.search_type,
                         rate_limit=args.rate_limit,
                         max_concurrent=args.max_concurrent,
                     )
                 else:
+                    # Single browser mode with optional single proxy
                     logger.info("🍪 Single-browser mode")
+                    
+                    # Get single proxy if pool available
+                    single_proxy = None
+                    if proxy_pool:
+                        single_proxy = await proxy_pool.get_available_proxy()
+                        if single_proxy:
+                            logger.info(f"   Using proxy: {single_proxy.host}:{single_proxy.port}")
+                    
+                    # Create cookie manager with optional proxy
+                    cookie_manager = CookieManager(
+                        cookie_file=cookie_file,
+                        test_origin=args.test_origin,
+                        test_destination=args.test_destination,
+                        test_days_ahead=args.test_days_ahead,
+                        proxy=single_proxy,
+                    )
                     
                     # Extract cookies if requested
                     if args.extract_cookies:
-                        await cookie_manager.get_cookies(
-                            force_refresh=True,
-                            headless=not args.no_headless,
-                            wait_time=args.cookie_wait_time,
-                        )
+                        try:
+                            await cookie_manager.get_cookies(
+                                force_refresh=True,
+                                headless=not args.no_headless,
+                                wait_time=args.cookie_wait_time,
+                            )
+                            
+                            # Mark proxy success
+                            if proxy_pool and single_proxy:
+                                await proxy_pool.mark_proxy_success(single_proxy)
+                                
+                        except Exception as e:
+                            # Handle IP blocking
+                            from .exceptions import IPBlockedError
+                            
+                            if isinstance(e, IPBlockedError) and proxy_pool and single_proxy:
+                                logger.error("Proxy got IP blocked during cookie extraction!")
+                                await proxy_pool.mark_proxy_blocked(single_proxy)
+                            elif proxy_pool and single_proxy:
+                                await proxy_pool.mark_proxy_failure(single_proxy)
+                            
+                            raise
                     
-                    # Run bulk scraping with single cookie manager (backwards compat)
+                    # Run bulk scraping with single cookie manager
                     bulk_results = await scrape_bulk_concurrent(
                         origins=[o.upper() for o in origins],
                         destinations=[d.upper() for d in destinations],
                         dates=dates,
                         passengers=args.passengers,
-                        cookie_manager=cookie_manager,  # Single browser mode
+                        cookie_manager=cookie_manager,
                         cabin_filter=args.cabin,
                         search_types=args.search_type,
                         rate_limit=args.rate_limit,
                         max_concurrent=args.max_concurrent,
                     )
                 
-                # Save all results (same for both modes)
+                # Save results (same for both modes)
                 output_dir = Path(args.output)
                 
                 successful_count = 0
@@ -576,9 +720,13 @@ def main() -> None:
                 logger.success(f"✓ Bulk scraping complete! Saved {successful_count} result sets")
                 logger.info(f"  Output directory: {output_dir}")
                 if use_multi_browser:
-                    logger.info(f"  Browsers used: {args.browsers}")
+                    logger.info(f"  Browsers used: {num_browsers}")
                     logger.info(f"  Per-browser concurrency: {args.max_concurrent}")
-                    logger.info(f"  Total effective concurrency: {args.browsers * args.max_concurrent}")
+                    logger.info(f"  Total effective concurrency: {num_browsers * args.max_concurrent}")
+                if proxy_pool:
+                    logger.info(f"  Proxies used: {len(proxy_pool.proxies)}")
+                    logger.info("")
+                    proxy_pool.print_stats()
                 logger.info("=" * 80)
                 
             else:
@@ -587,13 +735,46 @@ def main() -> None:
                     logger.error("Please specify exactly one origin, one destination, and one date.")
                     sys.exit(1)
 
+                # Get single proxy if pool available
+                single_proxy = None
+                if proxy_pool:
+                    single_proxy = await proxy_pool.get_available_proxy()
+                    if single_proxy:
+                        logger.info(f"Using proxy: {single_proxy.host}:{single_proxy.port}")
+
+                # Create cookie manager with optional proxy
+                cookie_manager = CookieManager(
+                    cookie_file=cookie_file,
+                    test_origin=args.test_origin,
+                    test_destination=args.test_destination,
+                    test_days_ahead=args.test_days_ahead,
+                    proxy=single_proxy,
+                )
+
                 # Extract cookies if requested
                 if args.extract_cookies:
-                    await cookie_manager.get_cookies(
-                        force_refresh=True,
-                        headless=not args.no_headless,
-                        wait_time=args.cookie_wait_time,
-                    )
+                    try:
+                        await cookie_manager.get_cookies(
+                            force_refresh=True,
+                            headless=not args.no_headless,
+                            wait_time=args.cookie_wait_time,
+                        )
+                        
+                        # Mark proxy success
+                        if proxy_pool and single_proxy:
+                            await proxy_pool.mark_proxy_success(single_proxy)
+                            
+                    except Exception as e:
+                        # Handle IP blocking
+                        from .exceptions import IPBlockedError
+                        
+                        if isinstance(e, IPBlockedError) and proxy_pool and single_proxy:
+                            logger.error("Proxy got IP blocked during cookie extraction!")
+                            await proxy_pool.mark_proxy_blocked(single_proxy)
+                        elif proxy_pool and single_proxy:
+                            await proxy_pool.mark_proxy_failure(single_proxy)
+                        
+                        raise
 
                 # Search flights
                 origin = origins[0]
@@ -613,6 +794,13 @@ def main() -> None:
                     search_types=args.search_type,
                     rate_limit=args.rate_limit,
                 )
+
+                # Mark proxy success/failure
+                if proxy_pool and single_proxy:
+                    if any(results.values()):
+                        await proxy_pool.mark_proxy_success(single_proxy)
+                    else:
+                        await proxy_pool.mark_proxy_failure(single_proxy)
 
                 # Check results
                 if not any(results.values()):
@@ -645,10 +833,11 @@ def main() -> None:
                         logger.info(f"  {search_type}: {len(result)} flights")
 
                 logger.info(f"  Output: {output_dir}")
+                if proxy_pool and single_proxy:
+                    logger.info(f"  Proxy: {single_proxy.host}:{single_proxy.port}")
                 logger.info("=" * 60)
 
         except IPBlockedError as e:
-            # 🆕 HANDLE IP BLOCKING WITH CLEAR GUIDANCE
             logger.error("")
             logger.error("=" * 80)
             logger.error("🚫 IP ADDRESS BLOCKED BY SERVER")
@@ -678,7 +867,7 @@ def main() -> None:
             logger.error("   • Consider using --rate-limit 0.5 or lower")
             logger.error("")
             logger.error("=" * 80)
-            sys.exit(2)  # Different exit code for IP blocking
+            sys.exit(2)
             
         except KeyboardInterrupt:
             logger.warning("Interrupted by user")
