@@ -5,7 +5,8 @@ import asyncio
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
-from itertools import product  # ADD THIS IMPORT
+from itertools import product
+from .cookie_pool import CookiePool
 
 from loguru import logger
 
@@ -111,7 +112,8 @@ async def scrape_bulk_concurrent(
     destinations: List[str],
     dates: List[str],
     passengers: int,
-    cookie_manager: CookieManager,
+    cookie_manager: Optional[CookieManager] = None,  # Single browser (backwards compat)
+    cookie_pool: Optional[CookiePool] = None,         # Multi-browser (new)
     cabin_filter: str = "COACH",
     search_types: List[str] = ["Award", "Revenue"],
     rate_limit: float = DEFAULT_RATE_LIMIT,
@@ -120,51 +122,93 @@ async def scrape_bulk_concurrent(
     """
     Scrape multiple origin-destination-date combinations concurrently.
     
+    Supports two modes:
+    1. Single browser (backwards compatible): Use cookie_manager
+    2. Multi-browser (new): Use cookie_pool with round-robin task assignment
+    
     Args:
         origins: List of origin airport codes
         destinations: List of destination airport codes
         dates: List of departure dates (YYYY-MM-DD)
         passengers: Number of passengers
-        cookie_manager: Cookie manager instance
+        cookie_manager: Single cookie manager (backwards compat)
+        cookie_pool: Multi-browser cookie pool (new feature)
         cabin_filter: Cabin class filter
         search_types: List of search types (Award, Revenue)
         rate_limit: Rate limit in requests per second
-        max_concurrent: Maximum concurrent route/date combinations
+        max_concurrent: Max concurrent for single browser OR total for multi-browser
     
     Returns:
         List of (origin, destination, date, results, raw_responses) tuples
     """
+    # Validate inputs
+    if cookie_manager is None and cookie_pool is None:
+        raise ValueError("Must provide either cookie_manager or cookie_pool")
+    
+    if cookie_manager and cookie_pool:
+        raise ValueError("Cannot use both cookie_manager and cookie_pool")
+    
     # Generate all combinations
     combinations = list(product(origins, destinations, dates))
     total = len(combinations)
     
+    # Determine mode
+    using_pool = cookie_pool is not None
+    
     logger.info("=" * 80)
-    logger.info(f"🚀 BULK CONCURRENT SCRAPING MODE")
-    logger.info("=" * 80)
+    if using_pool:
+        logger.info(f"🚀 MULTI-BROWSER BULK CONCURRENT SCRAPING")
+        logger.info("=" * 80)
+        logger.info(f"Browsers:      {cookie_pool.num_browsers}")
+        logger.info(f"Per-browser:   {cookie_pool.max_concurrent_per_browser} concurrent")
+        logger.info(f"Total max:     {cookie_pool.num_browsers * cookie_pool.max_concurrent_per_browser} concurrent")
+    else:
+        logger.info(f"🚀 SINGLE-BROWSER BULK CONCURRENT SCRAPING")
+        logger.info("=" * 80)
+        logger.info(f"Max concurrent: {max_concurrent}")
+    
     logger.info(f"Origins:       {', '.join(origins)}")
     logger.info(f"Destinations:  {', '.join(destinations)}")
     logger.info(f"Dates:         {', '.join(dates)}")
     logger.info(f"Total combos:  {total}")
-    logger.info(f"Max concurrent: {max_concurrent}")
     logger.info(f"Search types:  {', '.join(search_types)}")
     logger.info("=" * 80)
     logger.info("")
     
-    # Semaphore to limit concurrent tasks
-    semaphore = asyncio.Semaphore(max_concurrent)
+    # Create appropriate semaphore
+    if using_pool:
+        # No global semaphore - each browser has its own
+        semaphore = None
+    else:
+        # Single browser - use global semaphore
+        semaphore = asyncio.Semaphore(max_concurrent)
     
-    async def scrape_single_combo(origin: str, dest: str, date: str):
+    async def scrape_single_combo(task_id: int, origin: str, dest: str, date: str):
         """Scrape a single origin-destination-date combination"""
-        async with semaphore:
+        
+        # Get cookie manager for this task
+        if using_pool:
+            browser = cookie_pool.get_browser(task_id)
+            task_cookie_manager = browser['manager']
+            task_semaphore = browser['semaphore']
+            browser_id = browser['id']
+        else:
+            task_cookie_manager = cookie_manager
+            task_semaphore = semaphore
+            browser_id = None
+        
+        # Acquire semaphore
+        async with task_semaphore:
             try:
-                logger.info(f"🔍 Starting: {origin} → {dest} on {date}")
+                browser_prefix = f"[Browser #{browser_id}] " if browser_id is not None else ""
+                logger.info(f"{browser_prefix}🔍 Starting: {origin} → {dest} on {date}")
                 
                 results, raw_responses = await scrape_flights(
                     origin=origin,
                     destination=dest,
                     date=date,
                     passengers=passengers,
-                    cookie_manager=cookie_manager,
+                    cookie_manager=task_cookie_manager,
                     cabin_filter=cabin_filter,
                     search_types=search_types,
                     rate_limit=rate_limit,
@@ -175,24 +219,28 @@ async def scrape_bulk_concurrent(
                 total_flights = sum(len(r) for r in results.values() if r is not None)
                 
                 logger.success(
-                    f"✅ Completed: {origin} → {dest} on {date} "
+                    f"{browser_prefix}✅ Completed: {origin} → {dest} on {date} "
                     f"({success_count}/{len(search_types)} searches, {total_flights} flights)"
                 )
                 
                 return (origin, dest, date, results, raw_responses)
                 
             except Exception as e:
-                logger.error(f"❌ Failed: {origin} → {dest} on {date}: {e}")
+                browser_prefix = f"[Browser #{browser_id}] " if browser_id is not None else ""
+                logger.error(f"{browser_prefix}❌ Failed: {origin} → {dest} on {date}: {e}")
                 return (origin, dest, date, None, None)
     
     # Create tasks for all combinations
     tasks = [
-        scrape_single_combo(origin, dest, date)
-        for origin, dest, date in combinations
+        scrape_single_combo(i, origin, dest, date)
+        for i, (origin, dest, date) in enumerate(combinations)
     ]
     
     # Execute all tasks concurrently
-    logger.info(f"⚡ Executing {total} combinations with max {max_concurrent} concurrent...")
+    if using_pool:
+        logger.info(f"⚡ Executing {total} combinations across {cookie_pool.num_browsers} browsers...")
+    else:
+        logger.info(f"⚡ Executing {total} combinations with max {max_concurrent} concurrent...")
     logger.info("")
     
     start_time = asyncio.get_event_loop().time()
@@ -214,6 +262,12 @@ async def scrape_bulk_concurrent(
     logger.info(f"Failed:            {failed}")
     logger.info(f"Duration:          {duration:.1f}s")
     logger.info(f"Avg per combo:     {duration/total:.1f}s")
+    
+    if using_pool:
+        logger.info(f"Effective rate:    {successful/duration:.1f} combos/sec")
+        logger.info("")
+        cookie_pool.print_stats()
+    
     logger.info("=" * 80)
     logger.info("")
     
@@ -305,7 +359,15 @@ def main() -> None:
         "--max-concurrent",
         type=int,
         default=5,
-        help="Maximum concurrent route/date combinations for bulk search (default: 10)"
+        help="Maximum concurrent requests per browser (default: 5)"
+    )
+    search_group.add_argument(
+        "--browsers",
+        type=int,
+        default=1,
+        help="Number of parallel browsers with different cookies (default: 1). "
+             "Total concurrency = browsers × max-concurrent. "
+             "Example: --browsers 5 --max-concurrent 5 = 25 total concurrent requests"
     )
 
     # Configuration
@@ -372,28 +434,67 @@ def main() -> None:
                     )
                     sys.exit(1)
                 
-                # Extract cookies if requested
-                if args.extract_cookies:
-                    await cookie_manager.get_cookies(
-                        force_refresh=True,
+                # Determine if we need multi-browser mode
+                use_multi_browser = args.browsers > 1
+                
+                if use_multi_browser:
+                    logger.info(f"🍪 Multi-browser mode: {args.browsers} browsers")
+                    
+                    # Create cookie pool
+                    cookie_dir = Path("./cookies")
+                    cookie_pool = CookiePool(
+                        num_browsers=args.browsers,
+                        base_cookie_dir=cookie_dir,
+                        max_concurrent_per_browser=args.max_concurrent,
+                        test_origin=args.test_origin,
+                        test_destination=args.test_destination,
+                        test_days_ahead=args.test_days_ahead,
+                    )
+                    
+                    # Initialize all browser cookies
+                    await cookie_pool.initialize_all_cookies(
+                        force_refresh=args.extract_cookies,
                         headless=not args.no_headless,
                         wait_time=args.cookie_wait_time,
                     )
+                    
+                    # Run bulk scraping with cookie pool
+                    bulk_results = await scrape_bulk_concurrent(
+                        origins=[o.upper() for o in origins],
+                        destinations=[d.upper() for d in destinations],
+                        dates=dates,
+                        passengers=args.passengers,
+                        cookie_pool=cookie_pool,  # Multi-browser mode
+                        cabin_filter=args.cabin,
+                        search_types=args.search_type,
+                        rate_limit=args.rate_limit,
+                        max_concurrent=args.max_concurrent,
+                    )
+                else:
+                    logger.info("🍪 Single-browser mode")
+                    
+                    # Extract cookies if requested
+                    if args.extract_cookies:
+                        await cookie_manager.get_cookies(
+                            force_refresh=True,
+                            headless=not args.no_headless,
+                            wait_time=args.cookie_wait_time,
+                        )
+                    
+                    # Run bulk scraping with single cookie manager (backwards compat)
+                    bulk_results = await scrape_bulk_concurrent(
+                        origins=[o.upper() for o in origins],
+                        destinations=[d.upper() for d in destinations],
+                        dates=dates,
+                        passengers=args.passengers,
+                        cookie_manager=cookie_manager,  # Single browser mode
+                        cabin_filter=args.cabin,
+                        search_types=args.search_type,
+                        rate_limit=args.rate_limit,
+                        max_concurrent=args.max_concurrent,
+                    )
                 
-                # Run bulk scraping
-                bulk_results = await scrape_bulk_concurrent(
-                    origins=[o.upper() for o in origins],
-                    destinations=[d.upper() for d in destinations],
-                    dates=dates,
-                    passengers=args.passengers,
-                    cookie_manager=cookie_manager,
-                    cabin_filter=args.cabin,
-                    search_types=args.search_type,
-                    rate_limit=args.rate_limit,
-                    max_concurrent=args.max_concurrent,
-                )
-                
-                # Save all results
+                # Save all results (same for both modes)
                 output_dir = Path(args.output)
                 
                 successful_count = 0
@@ -421,6 +522,10 @@ def main() -> None:
                 logger.info("=" * 80)
                 logger.success(f"✓ Bulk scraping complete! Saved {successful_count} result sets")
                 logger.info(f"  Output directory: {output_dir}")
+                if use_multi_browser:
+                    logger.info(f"  Browsers used: {args.browsers}")
+                    logger.info(f"  Per-browser concurrency: {args.max_concurrent}")
+                    logger.info(f"  Total effective concurrency: {args.browsers * args.max_concurrent}")
                 logger.info("=" * 80)
                 
             else:

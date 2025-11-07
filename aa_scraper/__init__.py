@@ -17,12 +17,14 @@ from .exceptions import (
 from .models import CircuitState, ErrorType
 from .parser import FlightDataParser
 from .rate_limiter import AdaptiveRateLimiter
+from .cookie_pool import CookiePool
 
 __all__ = [
     "__version__",
     "AAFlightClient",
     "CircuitBreaker",
     "CookieManager",
+    "CookiePool",
     "AAScraperError",
     "CircuitOpenError",
     "CookieExpiredError",
