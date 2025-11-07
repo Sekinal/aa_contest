@@ -1055,7 +1055,7 @@ def main() -> None:
 
                 # Save results using async streaming storage
                 output_dir = Path(args.output)
-                output_file, num_flights = await save_results_streaming(
+                output_file, num_flights, _ = await save_results_streaming(
                     results,
                     raw_responses,
                     output_dir,
