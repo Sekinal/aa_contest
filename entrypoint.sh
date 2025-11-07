@@ -12,7 +12,39 @@ fix_permissions() {
     done
 }
 
+# Check if proxy file exists (if specified)
+check_proxy_file() {
+    if [ -n "$1" ]; then
+        if [ -f "$1" ]; then
+            echo "🌐 Proxy file found: $1"
+            # Fix permissions on proxy file
+            chown scraper:scraper "$1" 2>/dev/null || true
+            chmod 600 "$1" 2>/dev/null || true
+        else
+            echo "❌ ERROR: Proxy file not found: $1"
+            exit 1
+        fi
+    fi
+}
+
+# Extract proxy file path from arguments
+extract_proxy_file() {
+    for arg in "$@"; do
+        case "$arg" in
+            --proxy-file=*)
+                echo "${arg#--proxy-file=}"
+                return 0
+                ;;
+        esac
+    done
+}
+
 echo "🚀 AA Scraper starting..."
+
+# Check for proxy file argument
+PROXY_FILE=$(extract_proxy_file "$@")
+check_proxy_file "$PROXY_FILE"
+
 fix_permissions
 
 # Switch to scraper user and run the app
