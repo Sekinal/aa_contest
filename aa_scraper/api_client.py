@@ -3,7 +3,8 @@
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-import httpx
+from curl_cffi.requests import AsyncSession
+from curl_cffi import CurlError
 import json
 import time
 from loguru import logger
@@ -24,6 +25,7 @@ from .retry import retry_with_backoff
 class AAFlightClient:
     """
     Enhanced AA flight search client with:
+    - curl_cffi for Firefox fingerprint matching Camoufox
     - Automatic cookie refresh on 403 errors
     - Circuit breaker pattern
     - Exponential backoff retry
@@ -51,16 +53,16 @@ class AAFlightClient:
         self.circuit_breaker = CircuitBreaker(name="aa_api")
         self.session_start = datetime.now()
 
-        logger.info("Flight client initialized with auto-recovery and per‑request clients")
+        # Firefox 135 matches Camoufox best (latest stable Firefox fingerprint)
+        self.impersonate = "firefox135"
 
-    # ------------------------------------------------------------------ #
-    # Context‑manager helpers – nothing to clean up any more
+        logger.info(f"Flight client initialized with curl_cffi (impersonate: {self.impersonate})")
+
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         pass
-    # ------------------------------------------------------------------ #
 
     def _build_headers(
         self,
@@ -108,11 +110,10 @@ class AAFlightClient:
                 else:
                     headers["Referer"] = referer
         else:
-            # Minimal fallback headers
+            # Minimal fallback headers (curl_cffi will add browser headers automatically)
             headers = {
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0",
                 "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US",
+                "Accept-Language": "en-US,en;q=0.9",
                 "Content-Type": "application/json",
                 "Origin": BASE_URL,
                 "Sec-Fetch-Dest": "empty",
@@ -122,18 +123,12 @@ class AAFlightClient:
             if referer:
                 headers["Referer"] = referer
 
-        # ------------------------------------------------------------------ #
-        # Critical headers that must be present – add them if missing
+        # Critical headers that must be present
         headers_lower = {k.lower(): k for k in headers.keys()}
         if "x-xsrf-token" not in headers_lower and "XSRF-TOKEN" in cookies:
             headers["X-XSRF-TOKEN"] = cookies["XSRF-TOKEN"]
         if "x-cid" not in headers_lower and "spa_session_id" in cookies:
             headers["X-CID"] = cookies["spa_session_id"]
-        if "user-agent" not in headers_lower:
-            headers[
-                "User-Agent"
-            ] = "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0"
-        # ------------------------------------------------------------------ #
 
         return headers
 
@@ -197,82 +192,61 @@ class AAFlightClient:
         date: str,
         passengers: int,
         search_type: str,
-        http_version: str = "HTTP/2",
     ) -> Dict[str, Any]:
-        """Make a single API request (fresh client per call)"""
-        # -------------------------------------------------------------- #
-        # 1️⃣  Get fresh cookies / headers / referer
+        """Make a single API request using curl_cffi (fresh session per call)"""
+        # Get fresh cookies / headers / referer
         cookies, captured_headers, referer = await self.cookie_manager.get_cookies()
         headers = self._build_headers(cookies, captured_headers, referer)
 
-        # 2️⃣  Build payload
+        # Build payload
         payload = self._build_request_payload(
             origin, destination, date, passengers, search_type
         )
 
-        # 3️⃣  Log request meta‑data (helps debugging)
+        # Log request meta‑data
         request_id = f"{origin}-{destination}-{date}-{search_type}"
-        logger.info(f"🔍 [{request_id}] Starting {search_type} search via {http_version}")
+        logger.info(f"🔍 [{request_id}] Starting {search_type} search with curl_cffi (Firefox impersonation)")
         logger.debug(f"   Route: {origin} → {destination}")
         logger.debug(f"   Date: {date}")
         logger.debug(f"   Passengers: {passengers}")
-        logger.debug(f"   HTTP Version: {http_version}")
+        logger.debug(f"   Impersonate: {self.impersonate}")
 
-        # 4️⃣  Acquire a token from the adaptive rate limiter
+        # Acquire rate limit token
         await self.rate_limiter.acquire()
 
-        # 5️⃣  Choose HTTP/2 or HTTP/1.1
-        http2_enabled = http_version == "HTTP/2"
-
-        # 6️⃣  Use *conservative* connection limits – these are the same
-        #     numbers you used in the working Docker version.
-        limits = httpx.Limits(
-            max_keepalive_connections=5,
-            max_connections=10,
-            keepalive_expiry=30.0,
-        )
-
-        # -------------------------------------------------------------- #
-        # 7️⃣  Create a **fresh** AsyncClient for this single request.
-        async with httpx.AsyncClient(
-            cookies=cookies,
-            headers=headers,
-            timeout=self.timeout,
-            limits=limits,
-            http2=http2_enabled,
-            follow_redirects=True,
-        ) as client:
+        # Create fresh AsyncSession with Firefox impersonation
+        async with AsyncSession(impersonate=self.impersonate) as session:
             start_time = time.time()
             try:
-                response = await client.post(API_ENDPOINT, json=payload)
+                response = await session.post(
+                    API_ENDPOINT,
+                    json=payload,
+                    headers=headers,
+                    cookies=cookies,
+                    timeout=self.timeout,
+                )
                 request_duration = time.time() - start_time
-                logger.debug(
-                    f"   ← Response {response.status_code} ({request_duration:.2f}s)"
-                )
-                logger.debug(
-                    f"   ← Content-Type: {response.headers.get('content-type', 'unknown')}"
-                )
-            except httpx.TimeoutException as e:
+                logger.debug(f"   ← Response {response.status_code} ({request_duration:.2f}s)")
+                logger.debug(f"   ← Content-Type: {response.headers.get('content-type', 'unknown')}")
+
+            except TimeoutError as e:
                 logger.error(f"❌ [{request_id}] REQUEST TIMEOUT")
                 logger.error(f"   Error: {e}")
                 raise
-            except httpx.ConnectError as e:
-                logger.error(f"❌ [{request_id}] CONNECTION FAILED")
+            except CurlError as e:
+                logger.error(f"❌ [{request_id}] CURL ERROR")
                 logger.error(f"   Error: {e}")
                 raise
-            except httpx.HTTPError as e:
+            except Exception as e:
                 logger.error(f"❌ [{request_id}] HTTP ERROR")
                 logger.error(f"   Error: {e}")
                 raise
 
-        # -------------------------------------------------------------- #
-        # 8️⃣  Handle special status codes / HTML blocks
+        # Handle special status codes / HTML blocks
         content_type = response.headers.get("content-type", "").lower()
 
         if "text/html" in content_type or response.status_code in {403, 451}:
-            logger.warning(
-                f"⚠️ [{request_id}] Unexpected HTML response (possible block)"
-            )
+            logger.warning(f"⚠️ [{request_id}] Unexpected HTML response (possible block)")
             logger.warning(f"   Status: {response.status_code}")
             logger.warning(f"   Content-Type: {content_type}")
 
@@ -284,11 +258,8 @@ class AAFlightClient:
                     "Wait ~40 minutes before retrying."
                 )
             else:
-                # If we got HTML but not a clear block, raise a generic error
-                raise httpx.HTTPStatusError(
-                    f"Unexpected HTML response (status {response.status_code})",
-                    request=response.request,
-                    response=response,
+                raise Exception(
+                    f"Unexpected HTML response (status {response.status_code})"
                 )
 
         if response.status_code == 403:
@@ -297,18 +268,15 @@ class AAFlightClient:
 
         if response.status_code == 429:
             retry_after = int(response.headers.get("Retry-After", "60"))
-            logger.error(
-                f"⏰ [{request_id}] 429 RATE LIMITED – retry after {retry_after}s"
-            )
+            logger.error(f"⏰ [{request_id}] 429 RATE LIMITED – retry after {retry_after}s")
             await self.rate_limiter.backoff(retry_after)
             raise RateLimitError(f"Rate limited, retry after {retry_after}s")
 
         if response.status_code >= 400:
             logger.error(f"❌ [{request_id}] HTTP {response.status_code} ERROR")
-            response.raise_for_status()
+            raise Exception(f"HTTP {response.status_code} error")
 
-        # -------------------------------------------------------------- #
-        # 9️⃣  Parse JSON – raise if malformed
+        # Parse JSON
         try:
             data = response.json()
         except json.JSONDecodeError as e:
@@ -316,7 +284,7 @@ class AAFlightClient:
             logger.error(f"   Error: {e}")
             raise
 
-        # 10️⃣  Verify expected structure
+        # Verify expected structure
         if "slices" not in data:
             logger.error(f"❌ [{request_id}] MISSING 'slices' in API response")
             raise ValueError("API response missing 'slices' field")
@@ -334,13 +302,11 @@ class AAFlightClient:
                 f"segments: {len(first.get('segments', []))}"
             )
 
-        # 11️⃣  Tell the rate limiter we finished successfully
+        # Tell rate limiter we finished successfully
         await self.rate_limiter.recover()
 
         return data
 
-    # ------------------------------------------------------------------ #
-    # Helper to detect Akamai / generic Access‑Denied pages
     def _detect_permission_denied_in_response(self, response_text: str) -> bool:
         """
         Detect if API response contains Access Denied / Permission Denied page.
@@ -375,7 +341,6 @@ class AAFlightClient:
         )
 
         return any(p in text_lower for p in other_patterns) or has_reference
-    # ------------------------------------------------------------------ #
 
     async def search_flights(
         self,
@@ -387,28 +352,19 @@ class AAFlightClient:
     ) -> Optional[Dict[str, Any]]:
         """
         Search for flights with automatic recovery.
-        Tries HTTP/2, falls back to HTTP/1.1.
+        Uses curl_cffi with Firefox impersonation matching Camoufox.
         Auto‑refreshes cookies on 403 errors.
         """
 
         async def attempt_search():
-            """Single search attempt across HTTP versions"""
-            for http_version in ["HTTP/2", "HTTP/1.1"]:
-                try:
-                    return await self._make_request(
-                        origin,
-                        destination,
-                        date,
-                        passengers,
-                        search_type,
-                        http_version,
-                    )
-                except (httpx.StreamError, httpx.HTTPStatusError) as e:
-                    if http_version == "HTTP/2":
-                        logger.warning(f"HTTP/2 failed, trying HTTP/1.1: {e}")
-                        continue
-                    raise
-            return None
+            """Single search attempt"""
+            return await self._make_request(
+                origin,
+                destination,
+                date,
+                passengers,
+                search_type,
+            )
 
         async def on_retry_callback(attempt: int, error: Exception):
             """Handle retry attempts (refresh cookies, back‑off, etc.)"""
