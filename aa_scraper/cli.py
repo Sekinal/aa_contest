@@ -148,6 +148,7 @@ async def scrape_flights_with_metrics(
     cookie_manager: CookieManager,
     cabin_filter: str = "COACH",
     search_types: List[str] = ["Award", "Revenue"],
+    rate_limiter: Optional[AdaptiveRateLimiter] = None,
     rate_limit: float = DEFAULT_RATE_LIMIT,
 ) -> Tuple[Dict, Dict, Dict]:
     """
@@ -296,6 +297,14 @@ async def scrape_bulk_concurrent(
     global_storage = AsyncStreamingStorage(output_dir)
     logger.info(f"💾 Pre-initialized storage: {output_dir}")
 
+    # 🔥 CREATE SHARED RATE LIMITER (one for all combos!)
+    shared_rate_limiter = _get_shared_rate_limiter(
+        rate=rate_limit * 5,  # 🔥 5x multiplier for burst capacity!
+        burst=int(rate_limit * 30)  # Large burst for immediate concurrency
+    )
+
+    logger.info(f"🚀 Shared rate limiter: {rate_limit * 5} req/s, burst={int(rate_limit * 30)}")
+    
     # Determine mode
     using_pool = cookie_pool is not None
     
@@ -369,7 +378,7 @@ async def scrape_bulk_concurrent(
             task_semaphore = semaphore
             browser_id = None
         
-        # 🔥 GET FILE I/O SEMAPHORE (global limit on disk writes)
+        # 🔥 GET SHARED RESOURCES
         file_io_semaphore = _get_file_io_semaphore(max_concurrent_writes=3)
         
         # Acquire semaphore ONLY for scraping
@@ -381,7 +390,7 @@ async def scrape_bulk_concurrent(
                 # Track start time
                 combo_start = asyncio.get_event_loop().time()
                 
-                # Scrape flights with metrics
+                # 🔥 USE SHARED RATE LIMITER
                 results, raw_responses, task_metrics = await scrape_flights_with_metrics(
                     origin=origin,
                     destination=dest,
@@ -390,8 +399,10 @@ async def scrape_bulk_concurrent(
                     cookie_manager=task_cookie_manager,
                     cabin_filter=cabin_filter,
                     search_types=search_types,
+                    rate_limiter=shared_rate_limiter,  # 🔥 SHARED!
                     rate_limit=rate_limit,
                 )
+
                 
                 combo_duration = asyncio.get_event_loop().time() - combo_start
                 
